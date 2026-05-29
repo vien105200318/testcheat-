@@ -136,6 +136,7 @@ jobs:
           -framework Security \
           -framework MobileCoreServices \
           -framework IOKit \
+          -framework IOSurface \
           -lz \
           -llzma \
           -lcompression \
