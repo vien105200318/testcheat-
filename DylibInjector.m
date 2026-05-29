@@ -8,6 +8,7 @@
 #import <dlfcn.h>
 #import <sys/utsname.h>
 #import <errno.h>
+#import <libproc.h>
 
 // Kernel exploit
 #import "kexploit/kexploit_opa334.h"
@@ -290,7 +291,7 @@ static void injector_log_device_info(void) {
     return YES;
 }
 
-#pragma mark - Vnode Redirect Injection (stable - no runtime injection)
+#pragma mark - Runtime Injection (dlopen via RemoteCall)
 
 - (BOOL)injectDylib:(NSString *)dylibPath
             intoApp:(NSDictionary *)appInfo
@@ -299,9 +300,8 @@ static void injector_log_device_info(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *bundleID = appInfo[@"bundleID"];
     NSString *appName = appInfo[@"name"];
-    NSString *appPath = appInfo[@"path"];
 
-    NSLog(@"[Injector] Starting VNODE REDIRECT injection into %@ (%@)", appName, bundleID);
+    NSLog(@"[Injector] Starting RUNTIME injection into %@ (%@)", appName, bundleID);
 
     // Step 1: Run exploit if not ready
     if (!_exploitReady) {
@@ -317,118 +317,155 @@ static void injector_log_device_info(void) {
         }
     }
 
-    // Step 3: Get app path if needed
-    if (!appPath || appPath.length == 0) {
-        appPath = [self getAppPathForBundleID:bundleID];
-        if (!appPath) {
-            *error = [NSError errorWithDomain:@"InjectorError" code:3
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Cannot find app path"}];
-            return NO;
-        }
-    }
-
-    // Step 4: Get executable name
-    NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
-    NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-    NSString *executableName = infoPlist[@"CFBundleExecutable"];
-    if (!executableName) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:4
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find CFBundleExecutable"}];
-        return NO;
-    }
-
-    NSString *originalBinaryPath = [appPath stringByAppendingPathComponent:executableName];
-    NSLog(@"[Injector] Original binary: %@", originalBinaryPath);
-
-    // Step 5: Copy dylib to app's Documents folder (accessible by app)
-    NSString *appDataPath = [self getAppDataPathForBundleID:bundleID];
-    if (!appDataPath) {
-        appDataPath = @"/var/mobile/Library/Caches";
-    }
-
+    // Step 3: Copy dylib to /var/tmp (accessible by all apps)
     NSString *dylibName = [dylibPath lastPathComponent];
-    NSString *targetDylibPath = [appDataPath stringByAppendingPathComponent:dylibName];
-
-    // Try Documents subfolder
-    NSString *docsPath = [appDataPath stringByAppendingPathComponent:@"Documents"];
-    if ([fm fileExistsAtPath:docsPath]) {
-        targetDylibPath = [docsPath stringByAppendingPathComponent:dylibName];
-    }
+    NSString *targetDylibPath = [NSString stringWithFormat:@"/var/tmp/%@", dylibName];
 
     [fm removeItemAtPath:targetDylibPath error:nil];
     if (![fm copyItemAtPath:dylibPath toPath:targetDylibPath error:nil]) {
-        // Try /var/tmp as fallback
-        targetDylibPath = [NSString stringWithFormat:@"/var/tmp/%@", dylibName];
-        [fm removeItemAtPath:targetDylibPath error:nil];
-        if (![fm copyItemAtPath:dylibPath toPath:targetDylibPath error:nil]) {
-            *error = [NSError errorWithDomain:@"InjectorError" code:5
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Cannot copy dylib"}];
-            return NO;
-        }
+        *error = [NSError errorWithDomain:@"InjectorError" code:5
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot copy dylib to /var/tmp"}];
+        return NO;
     }
     NSLog(@"[Injector] Dylib copied to: %@", targetDylibPath);
     chmod(targetDylibPath.UTF8String, 0755);
 
-    // Step 6: Create patched binary in our Documents
-    NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *injectDir = [docsDir stringByAppendingPathComponent:@"Injected"];
-    NSString *appInjectDir = [injectDir stringByAppendingPathComponent:bundleID];
-    [fm createDirectoryAtPath:appInjectDir withIntermediateDirectories:YES attributes:nil error:nil];
-
-    NSString *patchedBinaryPath = [appInjectDir stringByAppendingPathComponent:executableName];
-    [fm removeItemAtPath:patchedBinaryPath error:nil];
-
-    NSData *binaryData = [NSData dataWithContentsOfFile:originalBinaryPath];
-    if (!binaryData) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:6
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot read original binary"}];
+    // Step 4: Launch target app
+    NSLog(@"[Injector] Launching target app...");
+    Class LSWorkspace = NSClassFromString(@"LSApplicationWorkspace");
+    if (!LSWorkspace) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:10
+                                 userInfo:@{NSLocalizedDescriptionKey: @"LSApplicationWorkspace not available"}];
         return NO;
     }
 
-    NSMutableData *mutableData = [binaryData mutableCopy];
-    if (![self patchBinaryData:mutableData toLoadDylib:targetDylibPath error:error]) {
+    id workspace = [LSWorkspace defaultWorkspace];
+    BOOL launched = [workspace openApplicationWithBundleID:bundleID];
+    if (!launched) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:11
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Failed to launch target app"}];
         return NO;
     }
 
-    if (![mutableData writeToFile:patchedBinaryPath atomically:YES]) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:7
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
+    // Step 5: Wait for app to launch and find PID
+    NSLog(@"[Injector] Waiting for app to launch...");
+    usleep(1500000); // 1.5 seconds for app to initialize
+
+    NSString *executableName = [self getExecutableNameForBundleID:bundleID];
+    if (!executableName) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:12
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot get executable name"}];
         return NO;
     }
-    NSLog(@"[Injector] Patched binary: %@", patchedBinaryPath);
 
-    // Step 7: Vnode redirect - swap original with patched
-    NSLog(@"[Injector] Applying vnode redirect...");
+    pid_t targetPid = [self findPidForProcessName:executableName];
+    if (targetPid <= 0) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:13
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find target app PID"}];
+        return NO;
+    }
+    NSLog(@"[Injector] Found target PID: %d", targetPid);
 
-    uint64_t orig_vnode = 0, orig_vdata = 0;
-    if (!vnode_redirect_file(originalBinaryPath.UTF8String, patchedBinaryPath.UTF8String,
-                             &orig_vnode, &orig_vdata)) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:8
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Vnode redirect failed"}];
+    // Step 6: Bypass AMFI for target process
+    NSLog(@"[Injector] Bypassing AMFI for target process...");
+    if (![self bypassAMFIForProcess:targetPid]) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:14
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Failed to bypass AMFI"}];
+        return NO;
+    }
+
+    // Step 7: Set up RemoteCall session for target app
+    NSLog(@"[Injector] Setting up RemoteCall session...");
+    RemoteCallSession *session = [[RemoteCallSession alloc] initWithProcess:executableName
+                                                          useMigFilterBypass:YES
+                                                     firstExceptionTimeoutMS:5000];
+
+    if (!session || ![session hasLocalState]) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:15
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Failed to create RemoteCall session"}];
+        return NO;
+    }
+    NSLog(@"[Injector] RemoteCall session ready");
+
+    // Step 8: Allocate memory in target for dylib path string
+    NSLog(@"[Injector] Calling dlopen in target process...");
+    uint64_t trojanMem = session.trojanMem;
+    if (!trojanMem || !is_kaddr_valid(trojanMem)) {
+        [session destroyRemoteCall];
+        *error = [NSError errorWithDomain:@"InjectorError" code:16
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Invalid trojan memory"}];
+        return NO;
+    }
+
+    // Write dylib path to remote memory (use offset into trojan mem)
+    uint64_t pathAddr = trojanMem + 0x100; // offset for path string
+    if (![session remoteWriteString:pathAddr value:targetDylibPath.UTF8String]) {
+        [session destroyRemoteCall];
+        *error = [NSError errorWithDomain:@"InjectorError" code:17
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Failed to write dylib path"}];
+        return NO;
+    }
+
+    // Step 9: Call dlopen(path, RTLD_NOW | RTLD_GLOBAL)
+    // RTLD_NOW = 0x2, RTLD_GLOBAL = 0x100
+    uint64_t result = [session doRemoteCallStableWithTimeout:10000
+                                                functionName:"dlopen"
+                                                          x0:pathAddr
+                                                          x1:(0x2 | 0x100)
+                                                          x2:0
+                                                          x3:0
+                                                          x4:0
+                                                          x5:0
+                                                          x6:0
+                                                          x7:0];
+
+    NSLog(@"[Injector] dlopen returned: 0x%llx", result);
+
+    // Cleanup RemoteCall session
+    [session destroyRemoteCall];
+
+    if (result == 0) {
+        // dlopen failed, try to get error
+        *error = [NSError errorWithDomain:@"InjectorError" code:18
+                                 userInfo:@{NSLocalizedDescriptionKey: @"dlopen failed - dylib may have wrong architecture or missing dependencies"}];
         return NO;
     }
 
     NSLog(@"[Injector] ========================================");
-    NSLog(@"[Injector] VNODE REDIRECT SUCCESSFUL!");
-    NSLog(@"[Injector] Binary: %@", originalBinaryPath);
+    NSLog(@"[Injector] RUNTIME INJECTION SUCCESSFUL!");
+    NSLog(@"[Injector] Target: %@ (PID %d)", appName, targetPid);
     NSLog(@"[Injector] Dylib: %@", targetDylibPath);
+    NSLog(@"[Injector] Handle: 0x%llx", result);
     NSLog(@"[Injector] ========================================");
-    NSLog(@"[Injector] NOW FORCE-CLOSE AND REOPEN THE APP!");
-    NSLog(@"[Injector] The dylib will load when app starts.");
-    NSLog(@"[Injector] Redirect active until device reboot.");
-    NSLog(@"[Injector] ========================================");
-
-    // DO NOT cleanup after injection!
-    // Recovery mechanism is DISABLED in exploit, so if we cleanup here:
-    // 1. _exploitReady becomes NO
-    // 2. Next injection tries to run FRESH exploit
-    // 3. But kernel is already modified → kernel panic
-    //
-    // Keep exploit state alive for multiple injections.
-    // Cleanup only happens on app termination (AppDelegate handlers).
-    NSLog(@"[Injector] Keeping exploit state alive for future injections");
 
     return YES;
+}
+
+// Find PID for a process name
+- (pid_t)findPidForProcessName:(NSString *)processName {
+    // Use proc_listpids or iterate through /proc
+    int pidCount = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (pidCount <= 0) return -1;
+
+    pid_t *pids = malloc(pidCount * sizeof(pid_t));
+    if (!pids) return -1;
+
+    pidCount = proc_listpids(PROC_ALL_PIDS, 0, pids, pidCount * sizeof(pid_t));
+
+    pid_t foundPid = -1;
+    for (int i = 0; i < pidCount; i++) {
+        char pathBuffer[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_pidpath(pids[i], pathBuffer, sizeof(pathBuffer)) > 0) {
+            NSString *path = [NSString stringWithUTF8String:pathBuffer];
+            if ([path.lastPathComponent isEqualToString:processName]) {
+                foundPid = pids[i];
+                break;
+            }
+        }
+    }
+
+    free(pids);
+    return foundPid;
 }
 
 - (NSString *)getAppDataPathForBundleID:(NSString *)bundleID {
