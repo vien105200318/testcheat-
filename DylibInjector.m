@@ -356,12 +356,34 @@ static void injector_log_device_info(void) {
     NSLog(@"[Injector] Waiting for app to launch...");
     usleep(1500000); // 1.5 seconds for app to initialize
 
-    NSString *executableName = [self getExecutableNameForBundleID:bundleID];
+    // Get executable name from appInfo path (more reliable than LSApplicationProxy)
+    NSString *appPath = appInfo[@"path"];
+    NSString *executableName = nil;
+
+    if (appPath && appPath.length > 0) {
+        NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+        executableName = info[@"CFBundleExecutable"];
+        NSLog(@"[Injector] Read executable from %@: %@", infoPlistPath, executableName);
+    }
+
+    // Fallback to LSApplicationProxy
+    if (!executableName) {
+        executableName = [self getExecutableNameForBundleID:bundleID];
+    }
+
+    // Last resort: use app name
+    if (!executableName) {
+        executableName = appInfo[@"name"];
+        NSLog(@"[Injector] Using app name as executable: %@", executableName);
+    }
+
     if (!executableName) {
         *error = [NSError errorWithDomain:@"InjectorError" code:12
                                  userInfo:@{NSLocalizedDescriptionKey: @"Cannot get executable name"}];
         return NO;
     }
+    NSLog(@"[Injector] Executable name: %@", executableName);
 
     pid_t targetPid = [self findPidForProcessName:executableName];
     if (targetPid <= 0) {
