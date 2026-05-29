@@ -7,6 +7,7 @@
 #import <sys/wait.h>
 #import <dlfcn.h>
 #import <sys/utsname.h>
+#import <errno.h>
 
 // Kernel exploit
 #import "kexploit/kexploit_opa334.h"
@@ -154,8 +155,32 @@ static void injector_log_device_info(void) {
 
     NSLog(@"[Injector] Escaping sandbox...");
 
+    // Step 1: Patch sandbox extensions for root access
     int ret = patch_sandbox_ext();
     if (ret != 0) {
+        NSLog(@"[Injector] patch_sandbox_ext failed: %d, trying borrow method...", ret);
+    } else {
+        NSLog(@"[Injector] patch_sandbox_ext succeeded");
+    }
+
+    // Step 2: Borrow sandbox extensions from installd (has app bundle access)
+    NSLog(@"[Injector] Borrowing sandbox extensions from installd...");
+    int borrow_ret = borrow_sandbox_ext("installd");
+    if (borrow_ret != 0) {
+        NSLog(@"[Injector] Warning: borrow from installd failed: %d", borrow_ret);
+        // Try lsd as fallback
+        borrow_ret = borrow_sandbox_ext("lsd");
+        if (borrow_ret != 0) {
+            NSLog(@"[Injector] Warning: borrow from lsd also failed: %d", borrow_ret);
+        } else {
+            NSLog(@"[Injector] Borrowed extensions from lsd");
+        }
+    } else {
+        NSLog(@"[Injector] Borrowed extensions from installd");
+    }
+
+    // Consider success if either method worked
+    if (ret != 0 && borrow_ret != 0) {
         *error = [NSError errorWithDomain:@"InjectorError" code:ret
                                  userInfo:@{NSLocalizedDescriptionKey: @"Sandbox escape failed"}];
         return NO;
@@ -239,11 +264,69 @@ static void injector_log_device_info(void) {
 
     NSLog(@"[Injector] Copying dylib to %@", destDylibPath);
 
+    // Remove existing file first
     [fm removeItemAtPath:destDylibPath error:nil];
-    if (![fm copyItemAtPath:dylibPath toPath:destDylibPath error:error]) {
-        NSLog(@"[Injector] Failed to copy dylib: %@", (*error).localizedDescription);
+
+    // Try normal copy first
+    NSError *copyError = nil;
+    BOOL copySuccess = [fm copyItemAtPath:dylibPath toPath:destDylibPath error:&copyError];
+
+    if (!copySuccess) {
+        NSLog(@"[Injector] Normal copy failed: %@, trying kernel-level copy...", copyError.localizedDescription);
+
+        // Fallback: Read file data and write using low-level APIs
+        NSData *dylibData = [NSData dataWithContentsOfFile:dylibPath];
+        if (!dylibData) {
+            *error = [NSError errorWithDomain:@"InjectorError" code:5
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Cannot read dylib file"}];
+            return NO;
+        }
+
+        // Try writing with different method - create file first
+        int fd = open(destDylibPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        if (fd == -1) {
+            NSLog(@"[Injector] open() failed: %s", strerror(errno));
+
+            // Last resort: try writing to app's Documents first, then copy
+            NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:dylibName];
+            if (![dylibData writeToFile:tempPath atomically:YES]) {
+                *error = [NSError errorWithDomain:@"InjectorError" code:6
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"Cannot write to app bundle: %@", copyError.localizedDescription]}];
+                return NO;
+            }
+
+            // Now try copy from temp
+            if (![fm copyItemAtPath:tempPath toPath:destDylibPath error:&copyError]) {
+                [fm removeItemAtPath:tempPath error:nil];
+                *error = [NSError errorWithDomain:@"InjectorError" code:7
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"Cannot copy to app bundle. Need more sandbox permissions. Error: %@", copyError.localizedDescription]}];
+                return NO;
+            }
+            [fm removeItemAtPath:tempPath error:nil];
+        } else {
+            ssize_t written = write(fd, dylibData.bytes, dylibData.length);
+            close(fd);
+
+            if (written != (ssize_t)dylibData.length) {
+                NSLog(@"[Injector] write() incomplete: %zd/%lu", written, (unsigned long)dylibData.length);
+                *error = [NSError errorWithDomain:@"InjectorError" code:8
+                                         userInfo:@{NSLocalizedDescriptionKey: @"Failed to write dylib data"}];
+                return NO;
+            }
+            NSLog(@"[Injector] Kernel-level write succeeded");
+        }
+    }
+
+    // Verify file was copied
+    if (![fm fileExistsAtPath:destDylibPath]) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:9
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Dylib copy verification failed"}];
         return NO;
     }
+
+    NSLog(@"[Injector] Dylib copied successfully");
 
     // Step 5: Patch main binary
     NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
