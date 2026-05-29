@@ -418,13 +418,15 @@ static void injector_log_device_info(void) {
     NSLog(@"[Injector] Redirect active until device reboot.");
     NSLog(@"[Injector] ========================================");
 
-    // IMPORTANT: Cleanup kernel state immediately after injection
-    // This prevents kernel panic if user kills the app
-    NSLog(@"[Injector] Cleaning up kernel state for safe exit...");
-    kexploit_terminal_cleanup();
-    _exploitReady = NO;
-    _sandboxEscaped = NO;
-    NSLog(@"[Injector] Kernel state cleaned - app can be safely closed now");
+    // DO NOT cleanup after injection!
+    // Recovery mechanism is DISABLED in exploit, so if we cleanup here:
+    // 1. _exploitReady becomes NO
+    // 2. Next injection tries to run FRESH exploit
+    // 3. But kernel is already modified → kernel panic
+    //
+    // Keep exploit state alive for multiple injections.
+    // Cleanup only happens on app termination (AppDelegate handlers).
+    NSLog(@"[Injector] Keeping exploit state alive for future injections");
 
     return YES;
 }
