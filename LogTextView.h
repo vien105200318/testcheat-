@@ -1,22 +1,19 @@
-// LogTextView.h - Stub for DylibInjector
+// LogTextView.h - Real-time log display
 #import <UIKit/UIKit.h>
 
 @interface LogTextView : UITextView
+
++ (instancetype)sharedInstance;
+- (void)appendLog:(NSString *)text;
 - (void)appendLogLine:(NSString *)line;
+- (void)clearLog;
+
 @end
 
-static inline void log_console(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-    printf("\n");
-}
+// Global log functions
+void log_to_ui(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+void log_console(const char *fmt, ...);
+void log_user(const char *fmt, ...);
 
-static inline void log_user(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-    printf("\n");
-}
+// Redirect NSLog to UI
+void setup_log_redirect(void);

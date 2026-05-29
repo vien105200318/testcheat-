@@ -37,6 +37,7 @@ jobs:
         OBJC_SOURCES="
           AppDelegate.m
           ViewController.m
+          LogTextView.m
           AppListManager.m
           DylibInjector.m
           kexploit/kexploit_opa334.m
