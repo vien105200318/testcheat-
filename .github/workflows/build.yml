@@ -27,8 +27,11 @@ jobs:
         SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
         echo "Using SDK: $SDK_PATH"
 
+        # Create choma symlink for <choma/xxx.h> includes
+        ln -sf src XPF/external/ChOma/choma
+
         # Include paths
-        INCLUDES="-I. -Ikexploit -ITaskRop -Iutils -Iresearch -IXPF/src -IXPF/external/ChOma/src"
+        INCLUDES="-I. -Ikexploit -ITaskRop -Iutils -Iresearch -IXPF/src -IXPF/external/ChOma/src -IXPF/external/ChOma"
 
         # Objective-C source files
         OBJC_SOURCES="
