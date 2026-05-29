@@ -6,13 +6,17 @@ THEOS_DEVICE_PORT = 2222
 
 INSTALL_TARGET_PROCESSES = DylibInjector
 
+# Set minimum iOS version
+export ARCHS = arm64
+export TARGET = iphone:clang:latest:14.0
+
 include $(THEOS)/makefiles/common.mk
 
 APPLICATION_NAME = DylibInjector
 
 DylibInjector_FILES = AppDelegate.m ViewController.m AppListManager.m DylibInjector.m
-DylibInjector_FRAMEWORKS = UIKit Foundation CoreGraphics
-DylibInjector_CFLAGS = -fobjc-arc
+DylibInjector_FRAMEWORKS = UIKit Foundation CoreGraphics UniformTypeIdentifiers
+DylibInjector_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 DylibInjector_CODESIGN_FLAGS = -Sentitlements.plist
 
 include $(THEOS_MAKE_PATH)/application.mk

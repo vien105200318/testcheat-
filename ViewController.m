@@ -2,6 +2,7 @@
 #import "ViewController.h"
 #import "AppListManager.h"
 #import "DylibInjector.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 @implementation ViewController
 
@@ -54,9 +55,9 @@
 #pragma mark - Select Dylib
 
 - (void)selectDylib {
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
-        initWithDocumentTypes:@[@"public.data"]
-        inMode:UIDocumentPickerModeImport];
+    // Use new API for iOS 14+
+    NSArray *types = @[UTTypeData];
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
     [self presentViewController:picker animated:YES completion:nil];

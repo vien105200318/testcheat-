@@ -87,6 +87,7 @@ jobs:
           -framework Foundation \
           -framework UIKit \
           -framework CoreGraphics \
+          -framework UniformTypeIdentifiers \
           -fobjc-arc \
           -o DylibInjector \
           AppDelegate.m ViewController.m AppListManager.m DylibInjector.m

@@ -3,6 +3,8 @@
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
 #import <sys/stat.h>
+#import <spawn.h>
+#import <sys/wait.h>
 
 // Private API
 @interface LSApplicationWorkspace : NSObject
@@ -311,20 +313,20 @@
     // Try ldid first (if available via TrollStore)
     NSString *ldidPath = @"/usr/bin/ldid";
     if ([[NSFileManager defaultManager] fileExistsAtPath:ldidPath]) {
-        NSTask *task = [[NSTask alloc] init];
-        task.launchPath = ldidPath;
-        task.arguments = @[@"-S", path];
-        @try {
-            [task launch];
-            [task waitUntilExit];
+        pid_t pid;
+        const char *argv[] = {"/usr/bin/ldid", "-S", [path UTF8String], NULL};
+
+        int status = posix_spawn(&pid, "/usr/bin/ldid", NULL, NULL, (char *const *)argv, NULL);
+        if (status == 0) {
+            waitpid(pid, &status, 0);
             NSLog(@"[Injector] Signed with ldid: %@", path);
-        } @catch (NSException *e) {
-            NSLog(@"[Injector] ldid failed: %@", e);
+        } else {
+            NSLog(@"[Injector] ldid spawn failed: %d", status);
         }
         return;
     }
 
-    // Alternative: use codesign (requires entitlements)
+    // Alternative: ad-hoc sign by removing signature
     NSLog(@"[Injector] No ldid found, skipping signing");
 }
 
