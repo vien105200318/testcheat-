@@ -52,7 +52,17 @@
     }
 
     log_console("[AppList] Using LSApplicationWorkspace API...");
+
+    // Try allInstalledApplications first
     NSArray *allApps = [workspace allInstalledApplications];
+    log_console("[AppList] allInstalledApplications returned %lu apps", (unsigned long)(allApps ? allApps.count : 0));
+
+    // If empty, try allApplications
+    if (!allApps || allApps.count == 0) {
+        allApps = [workspace allApplications];
+        log_console("[AppList] allApplications returned %lu apps", (unsigned long)(allApps ? allApps.count : 0));
+    }
+
     if (!allApps || allApps.count == 0) {
         log_console("[AppList] No apps from workspace, trying filesystem");
         return [self getAppsFromFileSystem];
@@ -165,15 +175,22 @@
 
     log_console("[AppList] Scanning filesystem for apps...");
 
-    // Common app locations
+    // Common app locations - try multiple paths
     NSArray *appDirs = @[
         @"/var/containers/Bundle/Application",
-        @"/private/var/containers/Bundle/Application"
+        @"/private/var/containers/Bundle/Application",
+        @"/var/mobile/Containers/Bundle/Application",
+        @"/private/var/mobile/Containers/Bundle/Application"
     ];
 
+    BOOL foundAnyDir = NO;
+
     for (NSString *baseDir in appDirs) {
-        if (![fm fileExistsAtPath:baseDir]) {
-            log_console("[AppList] Cannot access %s", baseDir.UTF8String);
+        BOOL isDir = NO;
+        BOOL exists = [fm fileExistsAtPath:baseDir isDirectory:&isDir];
+
+        if (!exists || !isDir) {
+            log_console("[AppList] Path not found: %s", baseDir.UTF8String);
             continue;
         }
 
@@ -183,9 +200,11 @@
         NSArray *uuids = [fm contentsOfDirectoryAtPath:baseDir error:&error];
         if (error) {
             log_console("[AppList] Error reading dir: %s", error.localizedDescription.UTF8String);
+            log_console("[AppList] Error code: %ld", (long)error.code);
             continue;
         }
 
+        foundAnyDir = YES;
         log_console("[AppList] Found %lu app containers", (unsigned long)uuids.count);
 
         for (NSString *uuid in uuids) {
@@ -224,6 +243,11 @@
     [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"name"] compare:b[@"name"] options:NSCaseInsensitiveSearch];
     }];
+
+    if (!foundAnyDir) {
+        log_console("[AppList] Could not access any app directory!");
+        log_console("[AppList] Sandbox escape may have failed - use manual Bundle ID input");
+    }
 
     log_console("[AppList] Found %lu apps from filesystem", (unsigned long)apps.count);
     return apps;

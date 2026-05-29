@@ -163,20 +163,31 @@ static void injector_log_device_info(void) {
         NSLog(@"[Injector] patch_sandbox_ext succeeded");
     }
 
-    // Step 2: Borrow sandbox extensions from installd (has app bundle access)
-    NSLog(@"[Injector] Borrowing sandbox extensions from installd...");
-    int borrow_ret = borrow_sandbox_ext("installd");
+    // Step 2: Borrow sandbox extensions from processes with app access
+    NSLog(@"[Injector] Borrowing sandbox extensions...");
+
+    // Try SpringBoard first (has access to all apps)
+    int borrow_ret = borrow_sandbox_ext("SpringBoard");
     if (borrow_ret != 0) {
-        NSLog(@"[Injector] Warning: borrow from installd failed: %d", borrow_ret);
-        // Try lsd as fallback
-        borrow_ret = borrow_sandbox_ext("lsd");
+        NSLog(@"[Injector] Warning: borrow from SpringBoard failed: %d", borrow_ret);
+
+        // Try installd (has app bundle access)
+        borrow_ret = borrow_sandbox_ext("installd");
         if (borrow_ret != 0) {
-            NSLog(@"[Injector] Warning: borrow from lsd also failed: %d", borrow_ret);
+            NSLog(@"[Injector] Warning: borrow from installd failed: %d", borrow_ret);
+
+            // Try lsd as fallback
+            borrow_ret = borrow_sandbox_ext("lsd");
+            if (borrow_ret != 0) {
+                NSLog(@"[Injector] Warning: borrow from lsd also failed: %d", borrow_ret);
+            } else {
+                NSLog(@"[Injector] Borrowed extensions from lsd");
+            }
         } else {
-            NSLog(@"[Injector] Borrowed extensions from lsd");
+            NSLog(@"[Injector] Borrowed extensions from installd");
         }
     } else {
-        NSLog(@"[Injector] Borrowed extensions from installd");
+        NSLog(@"[Injector] Borrowed extensions from SpringBoard");
     }
 
     // Consider success if either method worked
