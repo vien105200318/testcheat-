@@ -39,15 +39,15 @@ jobs:
         # Create control file for Theos
         mkdir -p control
         cat > control/control << 'EOF'
-        Package: com.research.dylibinjector
-        Name: DylibInjector
-        Version: 1.0
-        Architecture: iphoneos-arm
-        Description: Inject dylib into iOS apps
-        Maintainer: Research
-        Author: Research
-        Section: Utilities
-        EOF
+Package: com.research.dylibinjector
+Name: DylibInjector
+Version: 1.0
+Architecture: iphoneos-arm
+Description: Inject dylib into iOS apps
+Maintainer: Research
+Author: Research
+Section: Utilities
+EOF
 
         make package FINALPACKAGE=1
 
