@@ -70,30 +70,11 @@ static void atexit_handler(void) {
 }
 
 - (void)applicationDidEnterBackground:(UIApplication *)application {
-    NSLog(@"[AppDelegate] App entered background, running kernel cleanup...");
-
-    // Request background time to ensure cleanup completes
-    __block UIBackgroundTaskIdentifier bgTask = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"KernelCleanup" expirationHandler:^{
-        NSLog(@"[AppDelegate] Background task expired");
-        [[UIApplication sharedApplication] endBackgroundTask:bgTask];
-        bgTask = UIBackgroundTaskInvalid;
-    }];
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        NSLog(@"[AppDelegate] Starting kernel cleanup in background task...");
-        kexploit_terminal_cleanup();
-
-        // Reset injector state so it will re-run exploit on foreground
-        [[DylibInjector sharedInstance] resetState];
-
-        NSLog(@"[AppDelegate] Kernel cleanup completed");
-
-        // Small delay to ensure kernel state is fully parked
-        usleep(100000); // 100ms
-
-        [[UIApplication sharedApplication] endBackgroundTask:bgTask];
-        bgTask = UIBackgroundTaskInvalid;
-    });
+    // DO NOT cleanup on background - recovery mechanism is disabled in exploit
+    // If we cleanup here and user returns to app, exploit will crash trying to re-run
+    // Only cleanup on actual termination (applicationWillTerminate, signal handlers)
+    NSLog(@"[AppDelegate] App entered background - NOT cleaning up (recovery disabled)");
+    NSLog(@"[AppDelegate] Cleanup will only run on app termination");
 }
 
 @end
