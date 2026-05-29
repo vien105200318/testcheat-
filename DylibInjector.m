@@ -8,7 +8,12 @@
 #import <dlfcn.h>
 #import <sys/utsname.h>
 #import <errno.h>
-#import <libproc.h>
+
+// libproc functions (not in iOS SDK headers but available at runtime)
+#define PROC_ALL_PIDS 1
+#define PROC_PIDPATHINFO_MAXSIZE 4096
+extern int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
 // Kernel exploit
 #import "kexploit/kexploit_opa334.h"
