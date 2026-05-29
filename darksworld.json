@@ -1,0 +1,10 @@
+{
+	"path": "/",
+	"root": "/private/tmp/DylibInjector/Payload/DylibInjector.app",
+	"bundle_id": "com.research.dylibinjector",
+	"bundle_version": "1",
+	"bundle_executable": "DylibInjector",
+	"name": "Dylib Injector",
+	"files": ["DylibInjector"],
+	"changed": ["DylibInjector"]
+}

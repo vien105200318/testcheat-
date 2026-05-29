@@ -38,12 +38,21 @@
     // Get workspace
     Class LSApplicationWorkspaceClass = NSClassFromString(@"LSApplicationWorkspace");
     if (!LSApplicationWorkspaceClass) {
-        NSLog(@"[Injector] LSApplicationWorkspace not found");
-        return apps;
+        NSLog(@"[Injector] LSApplicationWorkspace not found, trying alternative method");
+        return [self getAppsFromFileSystem];
     }
 
     id workspace = [LSApplicationWorkspaceClass defaultWorkspace];
+    if (!workspace) {
+        NSLog(@"[Injector] Failed to get workspace, trying alternative method");
+        return [self getAppsFromFileSystem];
+    }
+
     NSArray *allApps = [workspace allInstalledApplications];
+    if (!allApps || allApps.count == 0) {
+        NSLog(@"[Injector] No apps from workspace, trying alternative method");
+        return [self getAppsFromFileSystem];
+    }
 
     for (id proxy in allApps) {
         @try {
@@ -141,6 +150,67 @@
         return url.path;
     }
     return nil;
+}
+
+// Alternative method: scan filesystem
+- (NSMutableArray *)getAppsFromFileSystem {
+    NSMutableArray *apps = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Common app locations
+    NSArray *appDirs = @[
+        @"/var/containers/Bundle/Application",
+        @"/private/var/containers/Bundle/Application"
+    ];
+
+    for (NSString *baseDir in appDirs) {
+        if (![fm fileExistsAtPath:baseDir]) continue;
+
+        NSError *error;
+        NSArray *uuids = [fm contentsOfDirectoryAtPath:baseDir error:&error];
+        if (error) continue;
+
+        for (NSString *uuid in uuids) {
+            NSString *uuidPath = [baseDir stringByAppendingPathComponent:uuid];
+            NSArray *contents = [fm contentsOfDirectoryAtPath:uuidPath error:nil];
+
+            for (NSString *item in contents) {
+                if ([item hasSuffix:@".app"]) {
+                    NSString *appPath = [uuidPath stringByAppendingPathComponent:item];
+                    NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+
+                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                    if (!info) continue;
+
+                    NSString *bundleID = info[@"CFBundleIdentifier"];
+                    NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"] ?: item;
+
+                    if (!bundleID) continue;
+
+                    // Skip this app
+                    if ([bundleID isEqualToString:[[NSBundle mainBundle] bundleIdentifier]]) continue;
+
+                    NSString *iconPath = [self getIconPathForApp:appPath];
+
+                    [apps addObject:@{
+                        @"name": name,
+                        @"bundleID": bundleID,
+                        @"path": appPath,
+                        @"bundleType": @"User",
+                        @"iconPath": iconPath ?: @""
+                    }];
+                }
+            }
+        }
+    }
+
+    // Sort by name
+    [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] compare:b[@"name"] options:NSCaseInsensitiveSearch];
+    }];
+
+    NSLog(@"[Injector] Found %lu apps from filesystem", (unsigned long)apps.count);
+    return apps;
 }
 
 @end

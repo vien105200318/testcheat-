@@ -56,6 +56,9 @@ jobs:
         # Copy entitlements (for reference)
         cp entitlements.plist Payload/DylibInjector.app/
 
+        # Copy DarksWorld JSON
+        cp darksworld.json Payload/DylibInjector.app/
+
         # Create empty LaunchScreen.storyboardc (minimal)
         mkdir -p Payload/DylibInjector.app/Base.lproj
 

@@ -99,16 +99,27 @@
     if (section == 0) {
         return self.selectedDylibPath ? [NSString stringWithFormat:@"Dylib: %@", self.selectedDylibPath.lastPathComponent] : @"Chưa chọn dylib";
     }
-    return @"Ứng dụng đã cài";
+    if (self.installedApps.count == 0) {
+        return @"Không tìm thấy app (cần quyền đặc biệt)";
+    }
+    return [NSString stringWithFormat:@"Ứng dụng đã cài (%lu)", (unsigned long)self.installedApps.count];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) return 0;
+    if (section == 0) return 1; // Manual input option
     return self.installedApps.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AppCell" forIndexPath:indexPath];
+
+    if (indexPath.section == 0) {
+        cell.textLabel.text = @"Nhập Bundle ID thủ công";
+        cell.detailTextLabel.text = @"Khi không tìm thấy app";
+        cell.imageView.image = [UIImage systemImageNamed:@"keyboard"];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
 
     NSDictionary *app = self.installedApps[indexPath.row];
     cell.textLabel.text = app[@"name"];
@@ -134,8 +145,47 @@
         return;
     }
 
+    if (indexPath.section == 0) {
+        [self showManualBundleIDInput];
+        return;
+    }
+
     self.selectedApp = self.installedApps[indexPath.row];
     [self showInjectConfirmation];
+}
+
+- (void)showManualBundleIDInput {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Nhập Bundle ID"
+                                                                   message:@"Nhập Bundle ID của app (vd: com.garena.game.kgvn)"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"com.example.app";
+        textField.keyboardType = UIKeyboardTypeASCIICapable;
+    }];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *bundleID = alert.textFields.firstObject.text;
+        if (bundleID.length > 0) {
+            // Try to find app path
+            NSString *appPath = [[AppListManager sharedManager] getAppPathForBundleID:bundleID];
+            if (!appPath) {
+                // Try common paths
+                appPath = [NSString stringWithFormat:@"/var/containers/Bundle/Application/*/%@.app", bundleID.lastPathComponent];
+            }
+
+            self.selectedApp = @{
+                @"name": bundleID,
+                @"bundleID": bundleID,
+                @"path": appPath ?: @"",
+                @"bundleType": @"User"
+            };
+            [self showInjectConfirmation];
+        }
+    }]];
+
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - Inject
