@@ -457,7 +457,10 @@ static void injector_log_device_info(void) {
         NSLog(@"[Injector] Warning: destroyRemoteCall returned %d, abandoning session", destroyResult);
         [session abandonRemoteCall];
     }
-    NSLog(@"[Injector] RemoteCall session cleaned up");
+
+    // Reset kernel caches to ensure our own proc/task are re-discovered correctly
+    kutils_reset_self_cache();
+    NSLog(@"[Injector] RemoteCall session cleaned up, kernel caches reset");
 
     if (result == 0) {
         // dlopen failed, try to get error
