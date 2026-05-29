@@ -14,7 +14,10 @@
 
     [self setupUI];
     [self logWelcomeMessage];
-    [self loadInstalledApps];
+
+    // Không quét apps khi khởi động - cần exploit trước
+    self.installedApps = [NSMutableArray array];
+    [self.tableView reloadData];
 }
 
 - (void)logWelcomeMessage {
@@ -94,10 +97,18 @@
 }
 
 - (void)loadInstalledApps {
+    [self.logView appendLogLine:@"[*] Scanning installed apps..."];
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         self.installedApps = [[AppListManager sharedManager] getInstalledApps];
+
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.tableView reloadData];
+            if (self.installedApps.count > 0) {
+                [self.logView appendLogLine:[NSString stringWithFormat:@"[+] Found %lu apps", (unsigned long)self.installedApps.count]];
+            } else {
+                [self.logView appendLogLine:@"[!] No apps found - run exploit first"];
+            }
         });
     });
 }

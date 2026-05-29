@@ -1,5 +1,6 @@
 // AppListManager.m - List installed apps on iOS
 #import "AppListManager.h"
+#import "LogTextView.h"
 #import <objc/runtime.h>
 
 // Private API declarations
@@ -35,24 +36,29 @@
 - (NSMutableArray *)getInstalledApps {
     NSMutableArray *apps = [NSMutableArray array];
 
+    log_console("[AppList] Getting installed apps...");
+
     // Get workspace
     Class LSApplicationWorkspaceClass = NSClassFromString(@"LSApplicationWorkspace");
     if (!LSApplicationWorkspaceClass) {
-        NSLog(@"[Injector] LSApplicationWorkspace not found, trying alternative method");
+        log_console("[AppList] LSApplicationWorkspace not found, trying filesystem");
         return [self getAppsFromFileSystem];
     }
 
     id workspace = [LSApplicationWorkspaceClass defaultWorkspace];
     if (!workspace) {
-        NSLog(@"[Injector] Failed to get workspace, trying alternative method");
+        log_console("[AppList] Failed to get workspace, trying filesystem");
         return [self getAppsFromFileSystem];
     }
 
+    log_console("[AppList] Using LSApplicationWorkspace API...");
     NSArray *allApps = [workspace allInstalledApplications];
     if (!allApps || allApps.count == 0) {
-        NSLog(@"[Injector] No apps from workspace, trying alternative method");
+        log_console("[AppList] No apps from workspace, trying filesystem");
         return [self getAppsFromFileSystem];
     }
+
+    log_console("[AppList] Processing %lu apps...", (unsigned long)allApps.count);
 
     for (id proxy in allApps) {
         @try {
@@ -75,8 +81,8 @@
                 continue;
             }
 
-            // Get icon path
-            NSString *iconPath = [self getIconPathForApp:bundleURL.path];
+            // Get icon path (skip for speed)
+            NSString *iconPath = nil; // [self getIconPathForApp:bundleURL.path];
 
             NSDictionary *appInfo = @{
                 @"name": name ?: @"Unknown",
@@ -89,7 +95,7 @@
             [apps addObject:appInfo];
 
         } @catch (NSException *e) {
-            NSLog(@"[Injector] Error reading app: %@", e);
+            // Skip problematic apps
         }
     }
 
@@ -98,7 +104,7 @@
         return [a[@"name"] compare:b[@"name"] options:NSCaseInsensitiveSearch];
     }];
 
-    NSLog(@"[Injector] Found %lu apps", (unsigned long)apps.count);
+    log_console("[AppList] Found %lu user apps", (unsigned long)apps.count);
     return apps;
 }
 
@@ -157,6 +163,8 @@
     NSMutableArray *apps = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
 
+    log_console("[AppList] Scanning filesystem for apps...");
+
     // Common app locations
     NSArray *appDirs = @[
         @"/var/containers/Bundle/Application",
@@ -164,11 +172,21 @@
     ];
 
     for (NSString *baseDir in appDirs) {
-        if (![fm fileExistsAtPath:baseDir]) continue;
+        if (![fm fileExistsAtPath:baseDir]) {
+            log_console("[AppList] Cannot access %s", baseDir.UTF8String);
+            continue;
+        }
+
+        log_console("[AppList] Scanning %s...", baseDir.UTF8String);
 
         NSError *error;
         NSArray *uuids = [fm contentsOfDirectoryAtPath:baseDir error:&error];
-        if (error) continue;
+        if (error) {
+            log_console("[AppList] Error reading dir: %s", error.localizedDescription.UTF8String);
+            continue;
+        }
+
+        log_console("[AppList] Found %lu app containers", (unsigned long)uuids.count);
 
         for (NSString *uuid in uuids) {
             NSString *uuidPath = [baseDir stringByAppendingPathComponent:uuid];
@@ -190,14 +208,12 @@
                     // Skip this app
                     if ([bundleID isEqualToString:[[NSBundle mainBundle] bundleIdentifier]]) continue;
 
-                    NSString *iconPath = [self getIconPathForApp:appPath];
-
                     [apps addObject:@{
                         @"name": name,
                         @"bundleID": bundleID,
                         @"path": appPath,
                         @"bundleType": @"User",
-                        @"iconPath": iconPath ?: @""
+                        @"iconPath": @""
                     }];
                 }
             }
@@ -209,7 +225,7 @@
         return [a[@"name"] compare:b[@"name"] options:NSCaseInsensitiveSearch];
     }];
 
-    NSLog(@"[Injector] Found %lu apps from filesystem", (unsigned long)apps.count);
+    log_console("[AppList] Found %lu apps from filesystem", (unsigned long)apps.count);
     return apps;
 }
 
