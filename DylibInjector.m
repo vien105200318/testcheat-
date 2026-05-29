@@ -15,6 +15,7 @@
 #import "kexploit/kutils.h"
 #import "kexploit/offsets.h"
 #import "utils/sandbox.h"
+#import "utils/file.h"
 #import "TaskRop/RemoteCall.h"
 
 // Device support check - same as Cyanide
@@ -246,45 +247,34 @@ static void injector_log_device_info(void) {
     // Remove existing file first
     [fm removeItemAtPath:destDylibPath error:nil];
 
-    // Try normal copy first
-    NSError *copyError = nil;
-    BOOL copySuccess = [fm copyItemAtPath:dylibPath toPath:destDylibPath error:&copyError];
+    // Use kernel-level copy for protected app bundles
+    int copyResult = kernel_copy_file(dylibPath.UTF8String, destDylibPath.UTF8String);
 
-    if (!copySuccess) {
-        NSLog(@"[Injector] Normal copy failed: %@, trying kernel-level copy...", copyError.localizedDescription);
+    if (copyResult != 0) {
+        NSLog(@"[Injector] kernel_copy_file failed, trying fallbacks...");
 
-        // Fallback: Read file data and write using low-level APIs
-        NSData *dylibData = [NSData dataWithContentsOfFile:dylibPath];
-        if (!dylibData) {
-            *error = [NSError errorWithDomain:@"InjectorError" code:5
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Cannot read dylib file"}];
-            return NO;
-        }
+        // Fallback 1: Try normal NSFileManager copy
+        NSError *copyError = nil;
+        if (![fm copyItemAtPath:dylibPath toPath:destDylibPath error:&copyError]) {
+            NSLog(@"[Injector] NSFileManager copy failed: %@", copyError.localizedDescription);
 
-        // Try writing with different method - create file first
-        int fd = open(destDylibPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-        if (fd == -1) {
-            NSLog(@"[Injector] open() failed: %s", strerror(errno));
+            // Fallback 2: Try open/write syscalls
+            NSData *dylibData = [NSData dataWithContentsOfFile:dylibPath];
+            if (!dylibData) {
+                *error = [NSError errorWithDomain:@"InjectorError" code:5
+                                         userInfo:@{NSLocalizedDescriptionKey: @"Cannot read dylib file"}];
+                return NO;
+            }
 
-            // Last resort: try writing to app's Documents first, then copy
-            NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:dylibName];
-            if (![dylibData writeToFile:tempPath atomically:YES]) {
+            int fd = open(destDylibPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+            if (fd == -1) {
+                NSLog(@"[Injector] open() failed: %s (errno=%d)", strerror(errno), errno);
                 *error = [NSError errorWithDomain:@"InjectorError" code:6
                                          userInfo:@{NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:@"Cannot write to app bundle: %@", copyError.localizedDescription]}];
+                    [NSString stringWithFormat:@"Cannot write to app bundle: %s", strerror(errno)]}];
                 return NO;
             }
 
-            // Now try copy from temp
-            if (![fm copyItemAtPath:tempPath toPath:destDylibPath error:&copyError]) {
-                [fm removeItemAtPath:tempPath error:nil];
-                *error = [NSError errorWithDomain:@"InjectorError" code:7
-                                         userInfo:@{NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:@"Cannot copy to app bundle. Need more sandbox permissions. Error: %@", copyError.localizedDescription]}];
-                return NO;
-            }
-            [fm removeItemAtPath:tempPath error:nil];
-        } else {
             ssize_t written = write(fd, dylibData.bytes, dylibData.length);
             close(fd);
 
@@ -294,7 +284,7 @@ static void injector_log_device_info(void) {
                                          userInfo:@{NSLocalizedDescriptionKey: @"Failed to write dylib data"}];
                 return NO;
             }
-            NSLog(@"[Injector] Kernel-level write succeeded");
+            NSLog(@"[Injector] Fallback write succeeded");
         }
     }
 
@@ -396,7 +386,31 @@ static void injector_log_device_info(void) {
     }
 
     if (success) {
-        [mutableData writeToFile:binaryPath atomically:YES];
+        // Write patched binary using kernel-level operations
+        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"patched_binary"];
+        if ([mutableData writeToFile:tmpPath atomically:YES]) {
+            // Use kernel_overwrite_file for protected binary
+            int ret = kernel_overwrite_file(tmpPath.UTF8String, binaryPath.UTF8String);
+            if (ret != 0) {
+                // Fallback to normal write
+                NSLog(@"[Injector] kernel_overwrite_file failed, trying normal write...");
+                if (![mutableData writeToFile:binaryPath atomically:YES]) {
+                    NSLog(@"[Injector] Binary write failed!");
+                    *error = [NSError errorWithDomain:@"InjectorError" code:13
+                                             userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
+                    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+                    return NO;
+                }
+            }
+            [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
+        } else {
+            // Direct write if temp fails
+            if (![mutableData writeToFile:binaryPath atomically:YES]) {
+                *error = [NSError errorWithDomain:@"InjectorError" code:13
+                                         userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
+                return NO;
+            }
+        }
     }
 
     return success;

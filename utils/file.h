@@ -21,4 +21,8 @@ uint64_t hide_path(const char* path);
 uint64_t reveal_path_by_vnode(uint64_t vnode);
 uint64_t overwrite_system_file(char* to, char* from);
 
+// Kernel-level file operations for protected paths
+int kernel_copy_file(const char* src_path, const char* dst_path);
+int kernel_overwrite_file(const char* src_path, const char* dst_path);
+
 #endif /* file_h */
