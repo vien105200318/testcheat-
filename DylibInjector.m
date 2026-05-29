@@ -390,11 +390,15 @@ static void injector_log_device_info(void) {
     }
     NSLog(@"[Injector] Connected to process PID=%d", session.pid);
 
-    // Step 7: Bypass AMFI to allow loading unsigned dylibs
+    // Step 7: AMFI Bypass - DISABLED for testing
+    // The AMFI bypass was causing kernel panic on device
+    // Try without it first to see if dlopen works
+    /*
     if (![self bypassAMFIForProcess:session.pid]) {
         NSLog(@"[Injector] Warning: AMFI bypass may have failed, dlopen might not work");
-        // Continue anyway - some apps might already have the right entitlements
     }
+    */
+    NSLog(@"[Injector] Skipping AMFI bypass (testing stability)");
 
     // Step 8: Write dylib path to remote memory
     uint64_t trojanMem = session.trojanMem;
