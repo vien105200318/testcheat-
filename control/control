@@ -1,0 +1,9 @@
+Package: com.research.dylibinjector
+Name: DylibInjector
+Version: 1.0
+Architecture: iphoneos-arm
+Description: Inject dylib into iOS apps. Requires TrollStore.
+Maintainer: Research
+Author: Research
+Section: Utilities
+Depends: firmware (>= 14.0)

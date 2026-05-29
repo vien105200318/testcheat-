@@ -1,0 +1,18 @@
+# Theos Makefile for DylibInjector
+# Build with: make package
+
+THEOS_DEVICE_IP = localhost
+THEOS_DEVICE_PORT = 2222
+
+INSTALL_TARGET_PROCESSES = DylibInjector
+
+include $(THEOS)/makefiles/common.mk
+
+APPLICATION_NAME = DylibInjector
+
+DylibInjector_FILES = AppDelegate.m ViewController.m AppListManager.m DylibInjector.m
+DylibInjector_FRAMEWORKS = UIKit Foundation CoreGraphics
+DylibInjector_CFLAGS = -fobjc-arc
+DylibInjector_CODESIGN_FLAGS = -Sentitlements.plist
+
+include $(THEOS_MAKE_PATH)/application.mk

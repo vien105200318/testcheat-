@@ -1,0 +1,20 @@
+# Build outputs
+*.app
+*.ipa
+*.deb
+DylibInjector
+Payload/
+
+# Theos
+.theos/
+packages/
+obj/
+
+# macOS
+.DS_Store
+*.xcodeproj
+*.xcworkspace
+
+# Temp
+*.log
+*.tmp

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for TrollStore -->
+    <key>platform-application</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.skip-library-validation</key>
+    <true/>
+
+    <!-- Required for app installation -->
+    <key>com.apple.lsapplicationworkspace.rebuildappdatabases</key>
+    <true/>
+    <key>com.apple.private.MobileInstallationHelperService.InstallApplication</key>
+    <true/>
+    <key>com.apple.private.MobileInstallationHelperService.UninstallApplication</key>
+    <true/>
+
+    <!-- File access -->
+    <key>com.apple.private.security.container-manager</key>
+    <true/>
+
+    <!-- Read other apps -->
+    <key>com.apple.private.MobileContainerManager.allowed</key>
+    <true/>
+</dict>
+</plist>

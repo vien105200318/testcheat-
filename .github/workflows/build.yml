@@ -1,0 +1,126 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Theos
+      run: |
+        brew install ldid make
+        echo "Setting up Theos..."
+        export THEOS=~/theos
+        git clone --recursive https://github.com/theos/theos.git $THEOS
+
+        # Download iOS SDK
+        curl -LO https://github.com/theos/sdks/archive/master.zip
+        unzip -q master.zip
+        mv sdks-master/*.sdk $THEOS/sdks/ 2>/dev/null || true
+        rm -rf master.zip sdks-master
+
+    - name: Build with Theos
+      run: |
+        export THEOS=~/theos
+        export PATH=$THEOS/bin:$PATH
+
+        # Use Theos Makefile
+        cp Makefile.theos Makefile
+
+        # Create control file for Theos
+        mkdir -p control
+        cat > control/control << 'EOF'
+        Package: com.research.dylibinjector
+        Name: DylibInjector
+        Version: 1.0
+        Architecture: iphoneos-arm
+        Description: Inject dylib into iOS apps
+        Maintainer: Research
+        Author: Research
+        Section: Utilities
+        EOF
+
+        make package FINALPACKAGE=1
+
+    - name: Create IPA from deb
+      run: |
+        # Extract deb and repackage as IPA
+        mkdir -p ipa_temp
+
+        # Find the deb file
+        DEB_FILE=$(find packages -name "*.deb" | head -1)
+
+        if [ -n "$DEB_FILE" ]; then
+          echo "Found deb: $DEB_FILE"
+
+          # Extract deb
+          dpkg-deb -x "$DEB_FILE" ipa_temp/
+
+          # Create Payload structure
+          mkdir -p ipa_temp/Payload
+          mv ipa_temp/Applications/*.app ipa_temp/Payload/ 2>/dev/null || true
+
+          # Create IPA
+          cd ipa_temp
+          zip -r ../DylibInjector.ipa Payload
+          cd ..
+        fi
+
+    - name: Alternative - Build with Xcode toolchain
+      if: failure()
+      run: |
+        # Fallback: use clang directly
+        SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+
+        clang -arch arm64 \
+          -isysroot "$SDK_PATH" \
+          -miphoneos-version-min=14.0 \
+          -framework Foundation \
+          -framework UIKit \
+          -framework CoreGraphics \
+          -fobjc-arc \
+          -o DylibInjector \
+          AppDelegate.m ViewController.m AppListManager.m DylibInjector.m
+
+        # Sign
+        ldid -Sentitlements.plist DylibInjector
+
+        # Create app bundle
+        mkdir -p Payload/DylibInjector.app
+        cp DylibInjector Payload/DylibInjector.app/
+        cp Info.plist Payload/DylibInjector.app/
+
+        # Create IPA
+        zip -r DylibInjector.ipa Payload
+
+    - name: Upload IPA
+      uses: actions/upload-artifact@v4
+      with:
+        name: DylibInjector-IPA
+        path: |
+          *.ipa
+          packages/*.deb
+        if-no-files-found: warn
+
+    - name: Create Release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v1.0.${{ github.run_number }}
+        name: Release v1.0.${{ github.run_number }}
+        files: |
+          *.ipa
+          packages/*.deb
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
