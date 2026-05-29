@@ -102,7 +102,9 @@
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0) {
-        return @"Exploit cần thiết để truy cập apps và inject dylib";
+        DylibInjector *injector = [DylibInjector sharedInstance];
+        NSString *deviceMsg = [injector deviceSupportMessage];
+        return [NSString stringWithFormat:@"Exploit cần thiết để truy cập apps và inject dylib.\n%@", deviceMsg];
     }
     return nil;
 }
@@ -127,6 +129,10 @@
                 cell.textLabel.text = @"✅ Exploit đã chạy";
                 cell.imageView.image = [UIImage systemImageNamed:@"checkmark.shield.fill"];
                 cell.textLabel.textColor = [UIColor systemGreenColor];
+            } else if (![injector isDeviceSupported]) {
+                cell.textLabel.text = @"⛔ Thiết bị không hỗ trợ";
+                cell.imageView.image = [UIImage systemImageNamed:@"xmark.shield.fill"];
+                cell.textLabel.textColor = [UIColor systemRedColor];
             } else {
                 cell.textLabel.text = @"🚀 Chạy Kernel Exploit";
                 cell.imageView.image = [UIImage systemImageNamed:@"bolt.shield.fill"];
@@ -196,6 +202,12 @@
 
 - (void)runExploit {
     DylibInjector *injector = [DylibInjector sharedInstance];
+
+    // Check device support first
+    if (![injector isDeviceSupported]) {
+        [self showAlert:@"Không hỗ trợ" message:[injector deviceSupportMessage]];
+        return;
+    }
 
     if ([injector isExploitReady]) {
         [self showAlert:@"Đã sẵn sàng" message:@"Exploit đã chạy thành công"];

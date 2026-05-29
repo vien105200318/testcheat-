@@ -6,6 +6,7 @@
 #import <spawn.h>
 #import <sys/wait.h>
 #import <dlfcn.h>
+#import <sys/utsname.h>
 
 // Kernel exploit
 #import "kexploit/kexploit_opa334.h"
@@ -14,6 +15,40 @@
 #import "kexploit/offsets.h"
 #import "utils/sandbox.h"
 #import "TaskRop/RemoteCall.h"
+
+// Device support check - same as Cyanide
+static NSComparisonResult injector_compare_system_version(NSString *version) {
+    return [UIDevice.currentDevice.systemVersion compare:version options:NSNumericSearch];
+}
+
+static BOOL injector_device_supported(void) {
+    // iOS 17.0 - 18.7.1
+    BOOL ios17to18 =
+        injector_compare_system_version(@"17.0") != NSOrderedAscending &&
+        injector_compare_system_version(@"18.7.1") != NSOrderedDescending;
+
+    // iOS 26.0 - 26.0.1
+    BOOL ios26 =
+        injector_compare_system_version(@"26.0") != NSOrderedAscending &&
+        injector_compare_system_version(@"26.0.1") != NSOrderedDescending;
+
+    return ios17to18 || ios26;
+}
+
+static NSString *injector_unsupported_message(void) {
+    NSString *version = UIDevice.currentDevice.systemVersion ?: @"unknown";
+    return [NSString stringWithFormat:@"Không hỗ trợ iOS %@. Yêu cầu: iOS/iPadOS 17.0-18.7.1 hoặc 26.0-26.0.1.", version];
+}
+
+static void injector_log_device_info(void) {
+    struct utsname u = {0};
+    const char *machine = "unknown";
+    if (uname(&u) == 0 && u.machine[0]) machine = u.machine;
+
+    NSString *version = UIDevice.currentDevice.systemVersion ?: @"unknown";
+    NSLog(@"[Injector] Device: %s, iOS %@", machine, version);
+    NSLog(@"[Injector] Supported: %@", injector_device_supported() ? @"YES" : @"NO");
+}
 
 // Private API
 @interface LSApplicationWorkspace : NSObject
@@ -56,19 +91,48 @@
 #pragma mark - Kernel Exploit
 
 - (BOOL)runExploit:(NSError **)error {
-    if (_exploitReady) {
-        NSLog(@"[Injector] Exploit already ready");
-        return YES;
+    // Log device info
+    injector_log_device_info();
+
+    // Check device support FIRST - same as Cyanide
+    if (!injector_device_supported()) {
+        NSString *msg = injector_unsupported_message();
+        NSLog(@"[Injector] %@", msg);
+        if (error) {
+            *error = [NSError errorWithDomain:@"InjectorError" code:-1
+                                     userInfo:@{NSLocalizedDescriptionKey: msg}];
+        }
+        return NO;
     }
 
-    NSLog(@"[Injector] Running kernel exploit...");
+    // Check if already ready AND KRW is still valid
+    if (_exploitReady) {
+        if (kexploit_krw_ready()) {
+            NSLog(@"[Injector] Reusing live KRW session");
+            return YES;
+        }
+        // KRW is stale, need to reset and re-run
+        NSLog(@"[Injector] Cached KRW is stale, resetting state...");
+        _exploitReady = NO;
+        _sandboxEscaped = NO;
+        kutils_reset_self_cache();
+    }
+
+    NSLog(@"[Injector] Running kernel exploit (recovery first, then fresh if needed)...");
 
     int ret = kexploit_opa334();
     if (ret != 0) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:ret
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Kernel exploit failed"}];
+        if (error) {
+            *error = [NSError errorWithDomain:@"InjectorError" code:ret
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Kernel exploit failed"}];
+        }
         NSLog(@"[Injector] Exploit failed: %d", ret);
         return NO;
+    }
+
+    // Validate KRW is working after exploit
+    if (!kexploit_krw_ready()) {
+        NSLog(@"[Injector] Warning: KRW validation failed after exploit");
     }
 
     _exploitReady = YES;
@@ -455,6 +519,17 @@
 
 - (BOOL)isSandboxEscaped {
     return _sandboxEscaped;
+}
+
+- (BOOL)isDeviceSupported {
+    return injector_device_supported();
+}
+
+- (NSString *)deviceSupportMessage {
+    if (injector_device_supported()) {
+        return [NSString stringWithFormat:@"iOS %@ được hỗ trợ", UIDevice.currentDevice.systemVersion];
+    }
+    return injector_unsupported_message();
 }
 
 @end

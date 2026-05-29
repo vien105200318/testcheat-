@@ -18,5 +18,7 @@
 // State
 - (BOOL)isExploitReady;
 - (BOOL)isSandboxEscaped;
+- (BOOL)isDeviceSupported;
+- (NSString *)deviceSupportMessage;
 
 @end
