@@ -417,12 +417,14 @@ static void injector_log_device_info(void) {
     // Step 8: Allocate memory in target for dylib path string
     NSLog(@"[Injector] Calling dlopen in target process...");
     uint64_t trojanMem = session.trojanMem;
-    if (!trojanMem || !is_kaddr_valid(trojanMem)) {
+    // Note: trojanMem is USER-SPACE address in target process, not kernel address
+    if (!trojanMem) {
         [session destroyRemoteCall];
         *error = [NSError errorWithDomain:@"InjectorError" code:16
                                  userInfo:@{NSLocalizedDescriptionKey: @"Invalid trojan memory"}];
         return NO;
     }
+    NSLog(@"[Injector] trojanMem (user-space in target): 0x%llx", trojanMem);
 
     // Write dylib path to remote memory (use offset into trojan mem)
     uint64_t pathAddr = trojanMem + 0x100; // offset for path string
@@ -448,8 +450,14 @@ static void injector_log_device_info(void) {
 
     NSLog(@"[Injector] dlopen returned: 0x%llx", result);
 
-    // Cleanup RemoteCall session
-    [session destroyRemoteCall];
+    // Cleanup RemoteCall session - MUST do this to avoid kernel state corruption
+    NSLog(@"[Injector] Destroying RemoteCall session...");
+    int destroyResult = [session destroyRemoteCall];
+    if (destroyResult != 0) {
+        NSLog(@"[Injector] Warning: destroyRemoteCall returned %d, abandoning session", destroyResult);
+        [session abandonRemoteCall];
+    }
+    NSLog(@"[Injector] RemoteCall session cleaned up");
 
     if (result == 0) {
         // dlopen failed, try to get error
