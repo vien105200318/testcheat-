@@ -1,18 +1,22 @@
-// DylibInjector.h
+// DylibInjector.h - Kernel-based injection
 #import <Foundation/Foundation.h>
 
 @interface DylibInjector : NSObject
 
 + (instancetype)sharedInstance;
 
-// Inject dylib into app
+// Kernel exploit
+- (BOOL)runExploit:(NSError **)error;
+- (BOOL)escapeSandbox:(NSError **)error;
+- (BOOL)initSpringBoardSession:(NSError **)error;
+
+// Injection
 - (BOOL)injectDylib:(NSString *)dylibPath
             intoApp:(NSDictionary *)appInfo
               error:(NSError **)error;
 
-// Patch Mach-O binary to load dylib
-- (BOOL)patchBinary:(NSString *)binaryPath
-      toLoadDylib:(NSString *)dylibName
-              error:(NSError **)error;
+// State
+- (BOOL)isExploitReady;
+- (BOOL)isSandboxEscaped;
 
 @end

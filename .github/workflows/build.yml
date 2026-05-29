@@ -19,7 +19,7 @@ jobs:
 
     - name: Setup Tools
       run: |
-        brew install ldid
+        brew install ldid lz4 lzfse
 
     - name: Build App
       run: |
@@ -27,7 +27,102 @@ jobs:
         SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
         echo "Using SDK: $SDK_PATH"
 
-        # Compile all source files
+        # Include paths
+        INCLUDES="-I. -Ikexploit -ITaskRop -Iutils -Iresearch -IXPF/src -IXPF/external/ChOma/src"
+
+        # Objective-C source files
+        OBJC_SOURCES="
+          AppDelegate.m
+          ViewController.m
+          AppListManager.m
+          DylibInjector.m
+          kexploit/kexploit_opa334.m
+          kexploit/krw.m
+          kexploit/kutils.m
+          kexploit/offsets.m
+          kexploit/persistence.m
+          kexploit/vnode.m
+          TaskRop/RemoteCall.m
+          TaskRop/PAC.m
+          TaskRop/VM.m
+          TaskRop/Thread.m
+          TaskRop/Exception.m
+          TaskRop/MigFilterBypassThread.m
+          utils/sandbox.m
+          utils/file.m
+          utils/process.m
+          utils/hexdump.m
+          research/amfi_research.m
+          research/sandbox_research.m
+          research/vnode_research.m
+        "
+
+        # C source files (XPF/ChOma)
+        C_SOURCES="
+          XPF/src/xpf.c
+          XPF/src/common.c
+          XPF/src/decompress.c
+          XPF/src/ppl.c
+          XPF/src/non_ppl.c
+          XPF/src/bad_recovery.c
+          XPF/external/ChOma/src/FileStream.c
+          XPF/external/ChOma/src/CodeDirectory.c
+          XPF/external/ChOma/src/Entitlements.c
+          XPF/external/ChOma/src/MachOLoadCommand.c
+          XPF/external/ChOma/src/CSBlob.c
+          XPF/external/ChOma/src/Util.c
+          XPF/external/ChOma/src/DyldSharedCache.c
+          XPF/external/ChOma/src/MemoryStream.c
+          XPF/external/ChOma/src/PatchFinder_arm64.c
+          XPF/external/ChOma/src/PatchFinder.c
+          XPF/external/ChOma/src/MachO.c
+          XPF/external/ChOma/src/Host.c
+          XPF/external/ChOma/src/DER.c
+          XPF/external/ChOma/src/Fat.c
+          XPF/external/ChOma/src/Base64.c
+          XPF/external/ChOma/src/BufferedStream.c
+          XPF/external/ChOma/src/arm64.c
+        "
+
+        # Compile C files first (no ARC)
+        echo "Compiling C sources..."
+        for src in $C_SOURCES; do
+          if [ -f "$src" ]; then
+            obj=$(basename "$src" .c).o
+            clang -arch arm64 \
+              -isysroot "$SDK_PATH" \
+              -miphoneos-version-min=14.0 \
+              $INCLUDES \
+              -DHAVE_COMPRESSION \
+              -Wno-deprecated-declarations \
+              -Wno-incompatible-pointer-types \
+              -Wno-unused-function \
+              -c "$src" -o "$obj"
+            echo "  Compiled: $src"
+          fi
+        done
+
+        # Compile Objective-C files with ARC
+        echo "Compiling Objective-C sources..."
+        for src in $OBJC_SOURCES; do
+          if [ -f "$src" ]; then
+            obj=$(basename "$src" .m).o
+            clang -arch arm64 \
+              -isysroot "$SDK_PATH" \
+              -miphoneos-version-min=14.0 \
+              $INCLUDES \
+              -fobjc-arc \
+              -Wno-deprecated-declarations \
+              -Wno-incompatible-pointer-types \
+              -Wno-unused-function \
+              -Wno-nullability-completeness \
+              -c "$src" -o "$obj"
+            echo "  Compiled: $src"
+          fi
+        done
+
+        # Link all object files
+        echo "Linking..."
         clang -arch arm64 \
           -isysroot "$SDK_PATH" \
           -miphoneos-version-min=14.0 \
@@ -35,12 +130,17 @@ jobs:
           -framework UIKit \
           -framework CoreGraphics \
           -framework UniformTypeIdentifiers \
-          -fobjc-arc \
-          -Wno-deprecated-declarations \
+          -framework Security \
+          -framework MobileCoreServices \
+          -framework IOKit \
+          -lz \
+          -llzma \
+          -lcompression \
           -o DylibInjector \
-          AppDelegate.m ViewController.m AppListManager.m DylibInjector.m
+          *.o
 
         echo "Build completed"
+        rm -f *.o
 
     - name: Create App Bundle
       run: |
@@ -56,8 +156,10 @@ jobs:
         # Copy entitlements (for reference)
         cp entitlements.plist Payload/DylibInjector.app/
 
-        # Copy DarksWorld JSON
-        cp darksworld.json Payload/DylibInjector.app/
+        # Copy DarksWorld JSON if exists
+        if [ -f darksworld.json ]; then
+          cp darksworld.json Payload/DylibInjector.app/
+        fi
 
         # Create empty LaunchScreen.storyboardc (minimal)
         mkdir -p Payload/DylibInjector.app/Base.lproj
@@ -97,9 +199,11 @@ jobs:
         tag_name: v1.0.${{ github.run_number }}
         name: DylibInjector v1.0.${{ github.run_number }}
         body: |
-          iOS Dylib Injector for TrollStore
+          iOS Dylib Injector với Kernel Exploit (Cyanide/DarksWorld)
 
-          Install via TrollStore
+          Hỗ trợ iOS 16.0 - 18.x (không cần jailbreak hoặc TrollStore)
+
+          Cài đặt qua Esign hoặc Sideloadly
         files: DylibInjector.ipa
         draft: false
         prerelease: false

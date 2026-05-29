@@ -1,19 +1,39 @@
-// DylibInjector.m - Core injection logic
+// DylibInjector.m - Kernel-based injection using Cyanide exploit
 #import "DylibInjector.h"
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
 #import <sys/stat.h>
 #import <spawn.h>
 #import <sys/wait.h>
+#import <dlfcn.h>
+
+// Kernel exploit
+#import "kexploit/kexploit_opa334.h"
+#import "kexploit/krw.h"
+#import "kexploit/kutils.h"
+#import "kexploit/offsets.h"
+#import "utils/sandbox.h"
+#import "TaskRop/RemoteCall.h"
 
 // Private API
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
 - (BOOL)installApplication:(NSURL *)appURL withOptions:(NSDictionary *)options error:(NSError **)error;
 - (BOOL)uninstallApplication:(NSString *)bundleID withOptions:(NSDictionary *)options error:(NSError **)error;
+- (BOOL)openApplicationWithBundleID:(NSString *)bundleID;
 @end
 
-@implementation DylibInjector
+@interface LSApplicationProxy : NSObject
++ (instancetype)applicationProxyForIdentifier:(NSString *)bundleID;
+@property (nonatomic, readonly) NSURL *bundleURL;
+@property (nonatomic, readonly) NSURL *dataContainerURL;
+@end
+
+@implementation DylibInjector {
+    BOOL _exploitReady;
+    BOOL _sandboxEscaped;
+    RemoteCallSession *_springboardSession;
+}
 
 + (instancetype)sharedInstance {
     static DylibInjector *instance;
@@ -23,6 +43,94 @@
     });
     return instance;
 }
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _exploitReady = NO;
+        _sandboxEscaped = NO;
+    }
+    return self;
+}
+
+#pragma mark - Kernel Exploit
+
+- (BOOL)runExploit:(NSError **)error {
+    if (_exploitReady) {
+        NSLog(@"[Injector] Exploit already ready");
+        return YES;
+    }
+
+    NSLog(@"[Injector] Running kernel exploit...");
+
+    int ret = kexploit_opa334();
+    if (ret != 0) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:ret
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Kernel exploit failed"}];
+        NSLog(@"[Injector] Exploit failed: %d", ret);
+        return NO;
+    }
+
+    _exploitReady = YES;
+    NSLog(@"[Injector] Exploit successful! kernel_base=0x%llx slide=0x%llx", g_kernel_base, g_kernel_slide);
+    return YES;
+}
+
+- (BOOL)escapeSandbox:(NSError **)error {
+    if (_sandboxEscaped) {
+        NSLog(@"[Injector] Sandbox already escaped");
+        return YES;
+    }
+
+    if (!_exploitReady) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:1
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Exploit not ready"}];
+        return NO;
+    }
+
+    NSLog(@"[Injector] Escaping sandbox...");
+
+    int ret = patch_sandbox_ext();
+    if (ret != 0) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:ret
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Sandbox escape failed"}];
+        return NO;
+    }
+
+    _sandboxEscaped = YES;
+    NSLog(@"[Injector] Sandbox escaped successfully!");
+    return YES;
+}
+
+- (BOOL)initSpringBoardSession:(NSError **)error {
+    if (_springboardSession) {
+        NSLog(@"[Injector] SpringBoard session already active");
+        return YES;
+    }
+
+    if (!_exploitReady) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:1
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Exploit not ready"}];
+        return NO;
+    }
+
+    NSLog(@"[Injector] Initializing SpringBoard RemoteCall session...");
+
+    _springboardSession = [[RemoteCallSession alloc] initWithProcess:@"SpringBoard"
+                                                    useMigFilterBypass:YES
+                                               firstExceptionTimeoutMS:3000];
+
+    if (!_springboardSession || ![_springboardSession hasLocalState]) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:2
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Failed to initialize SpringBoard session"}];
+        return NO;
+    }
+
+    NSLog(@"[Injector] SpringBoard session ready!");
+    return YES;
+}
+
+#pragma mark - Injection
 
 - (BOOL)injectDylib:(NSString *)dylibPath
             intoApp:(NSDictionary *)appInfo
@@ -35,87 +143,99 @@
 
     NSLog(@"[Injector] Starting injection into %@ (%@)", appName, bundleID);
 
-    // 1. Create temp directory
-    NSString *tempDir = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-    NSString *tempAppPath = [tempDir stringByAppendingPathComponent:[appPath lastPathComponent]];
-
-    if (![fm createDirectoryAtPath:tempDir withIntermediateDirectories:YES attributes:nil error:error]) {
-        return NO;
+    // Step 1: Run exploit if not ready
+    if (!_exploitReady) {
+        if (![self runExploit:error]) {
+            return NO;
+        }
     }
 
-    // 2. Copy app to temp
-    NSLog(@"[Injector] Copying app to temp...");
-    if (![fm copyItemAtPath:appPath toPath:tempAppPath error:error]) {
-        [fm removeItemAtPath:tempDir error:nil];
-        return NO;
+    // Step 2: Escape sandbox
+    if (!_sandboxEscaped) {
+        if (![self escapeSandbox:error]) {
+            return NO;
+        }
     }
 
-    // 3. Copy dylib into app bundle
+    // Step 3: Get actual app path if empty
+    if (!appPath || appPath.length == 0) {
+        appPath = [self getAppPathForBundleID:bundleID];
+        if (!appPath) {
+            *error = [NSError errorWithDomain:@"InjectorError" code:3
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Cannot find app path"}];
+            return NO;
+        }
+    }
+
+    NSLog(@"[Injector] App path: %@", appPath);
+
+    // Step 4: Copy dylib into app bundle
     NSString *dylibName = [dylibPath lastPathComponent];
-    NSString *destDylibPath = [tempAppPath stringByAppendingPathComponent:dylibName];
+    NSString *destDylibPath = [appPath stringByAppendingPathComponent:dylibName];
 
-    NSLog(@"[Injector] Copying dylib...");
+    NSLog(@"[Injector] Copying dylib to %@", destDylibPath);
+
     [fm removeItemAtPath:destDylibPath error:nil];
     if (![fm copyItemAtPath:dylibPath toPath:destDylibPath error:error]) {
-        [fm removeItemAtPath:tempDir error:nil];
+        NSLog(@"[Injector] Failed to copy dylib: %@", (*error).localizedDescription);
         return NO;
     }
 
-    // 4. Find and patch main binary
-    NSString *infoPlistPath = [tempAppPath stringByAppendingPathComponent:@"Info.plist"];
+    // Step 5: Patch main binary
+    NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
     NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
     NSString *executableName = infoPlist[@"CFBundleExecutable"];
 
     if (!executableName) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:1
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Không tìm thấy CFBundleExecutable"}];
-        [fm removeItemAtPath:tempDir error:nil];
+        *error = [NSError errorWithDomain:@"InjectorError" code:4
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot find CFBundleExecutable"}];
         return NO;
     }
 
-    NSString *binaryPath = [tempAppPath stringByAppendingPathComponent:executableName];
+    NSString *binaryPath = [appPath stringByAppendingPathComponent:executableName];
 
     NSLog(@"[Injector] Patching binary: %@", executableName);
-    if (![self patchBinary:binaryPath toLoadDylib:[@"@executable_path/" stringByAppendingString:dylibName] error:error]) {
-        [fm removeItemAtPath:tempDir error:nil];
+
+    NSString *loadPath = [@"@executable_path/" stringByAppendingString:dylibName];
+    if (![self patchBinary:binaryPath toLoadDylib:loadPath error:error]) {
         return NO;
     }
 
-    // 5. Sign the dylib and binary (using ldid or codesign)
-    NSLog(@"[Injector] Signing...");
+    // Step 6: Re-sign binary and dylib (using ldid)
+    NSLog(@"[Injector] Re-signing...");
     [self signFile:destDylibPath];
     [self signFile:binaryPath];
 
-    // 6. Uninstall old app
-    NSLog(@"[Injector] Uninstalling old app...");
-    Class LSWorkspace = NSClassFromString(@"LSApplicationWorkspace");
-    id workspace = [LSWorkspace defaultWorkspace];
+    // Step 7: Touch app to invalidate cache
+    NSLog(@"[Injector] Invalidating app cache...");
+    [self touchAppBundle:appPath];
 
-    NSError *uninstallError;
-    [workspace uninstallApplication:bundleID withOptions:nil error:&uninstallError];
-    // Ignore uninstall error, may not be installed
+    NSLog(@"[Injector] Injection completed successfully!");
+    NSLog(@"[Injector] Restart the app to load dylib");
 
-    // 7. Install modified app
-    NSLog(@"[Injector] Installing modified app...");
-    NSURL *appURL = [NSURL fileURLWithPath:tempAppPath];
+    return YES;
+}
 
-    NSDictionary *options = @{
-        @"CFBundleIdentifier": bundleID,
-        @"AllowInstallLocalProvisioned": @YES
-    };
+- (NSString *)getAppPathForBundleID:(NSString *)bundleID {
+    Class LSProxy = NSClassFromString(@"LSApplicationProxy");
+    if (!LSProxy) return nil;
 
-    BOOL installed = [workspace installApplication:appURL withOptions:options error:error];
-
-    // Cleanup
-    [fm removeItemAtPath:tempDir error:nil];
-
-    if (installed) {
-        NSLog(@"[Injector] Success!");
-    } else {
-        NSLog(@"[Injector] Install failed: %@", (*error).localizedDescription);
+    id proxy = [LSProxy applicationProxyForIdentifier:bundleID];
+    if (proxy) {
+        NSURL *url = [proxy bundleURL];
+        return url.path;
     }
+    return nil;
+}
 
-    return installed;
+- (void)touchAppBundle:(NSString *)appPath {
+    // Touch Info.plist to invalidate cache
+    NSString *infoPlist = [appPath stringByAppendingPathComponent:@"Info.plist"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSDictionary *attrs = @{NSFileModificationDate: [NSDate date]};
+    [fm setAttributes:attrs ofItemAtPath:infoPlist error:nil];
+    [fm setAttributes:attrs ofItemAtPath:appPath error:nil];
 }
 
 #pragma mark - Mach-O Patching
@@ -126,8 +246,8 @@
 
     NSData *binaryData = [NSData dataWithContentsOfFile:binaryPath];
     if (!binaryData) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:2
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Không đọc được binary"}];
+        *error = [NSError errorWithDomain:@"InjectorError" code:10
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot read binary"}];
         return NO;
     }
 
@@ -138,17 +258,14 @@
     BOOL success = NO;
 
     if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
-        // FAT binary - patch all architectures
         success = [self patchFatBinary:mutableData dylibName:dylibName error:error];
     } else if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64) {
-        // 64-bit Mach-O
         success = [self patchMachO64:mutableData offset:0 dylibName:dylibName error:error];
     } else if (magic == MH_MAGIC || magic == MH_CIGAM) {
-        // 32-bit Mach-O
         success = [self patchMachO32:mutableData offset:0 dylibName:dylibName error:error];
     } else {
-        *error = [NSError errorWithDomain:@"InjectorError" code:3
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Định dạng binary không hỗ trợ"}];
+        *error = [NSError errorWithDomain:@"InjectorError" code:11
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Unsupported binary format"}];
         return NO;
     }
 
@@ -209,15 +326,15 @@
     // Create new LC_LOAD_DYLIB command
     uint32_t nameLen = (uint32_t)dylibName.length + 1;
     uint32_t cmdSize = sizeof(struct dylib_command) + nameLen;
-    cmdSize = (cmdSize + 7) & ~7; // Align to 8 bytes
+    cmdSize = (cmdSize + 7) & ~7;
 
     // Check if there's space in header
     uint32_t headerEnd = sizeof(struct mach_header_64) + header->sizeofcmds;
     uint32_t firstSectionOffset = [self findFirstSectionOffset64:bytes];
 
     if (headerEnd + cmdSize > firstSectionOffset) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:4
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Không đủ chỗ trong header"}];
+        *error = [NSError errorWithDomain:@"InjectorError" code:12
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Not enough space in header"}];
         return NO;
     }
 
@@ -246,7 +363,6 @@
     uint8_t *bytes = (uint8_t *)data.mutableBytes + offset;
     struct mach_header *header = (struct mach_header *)bytes;
 
-    // Similar to 64-bit but with mach_header instead of mach_header_64
     uint32_t cmdOffset = sizeof(struct mach_header);
     for (uint32_t i = 0; i < header->ncmds; i++) {
         struct load_command *cmd = (struct load_command *)(bytes + cmdOffset);
@@ -263,7 +379,7 @@
 
     uint32_t nameLen = (uint32_t)dylibName.length + 1;
     uint32_t cmdSize = sizeof(struct dylib_command) + nameLen;
-    cmdSize = (cmdSize + 3) & ~3; // Align to 4 bytes
+    cmdSize = (cmdSize + 3) & ~3;
 
     struct dylib_command newCmd = {0};
     newCmd.cmd = LC_LOAD_DYLIB;
@@ -310,24 +426,35 @@
 #pragma mark - Signing
 
 - (void)signFile:(NSString *)path {
-    // Try ldid first (if available via TrollStore)
+    // Use ldid if available
     NSString *ldidPath = @"/usr/bin/ldid";
+    if (![[NSFileManager defaultManager] fileExistsAtPath:ldidPath]) {
+        ldidPath = @"/var/jb/usr/bin/ldid";
+    }
+
     if ([[NSFileManager defaultManager] fileExistsAtPath:ldidPath]) {
         pid_t pid;
-        const char *argv[] = {"/usr/bin/ldid", "-S", [path UTF8String], NULL};
+        const char *argv[] = {ldidPath.UTF8String, "-S", [path UTF8String], NULL};
 
-        int status = posix_spawn(&pid, "/usr/bin/ldid", NULL, NULL, (char *const *)argv, NULL);
+        int status = posix_spawn(&pid, ldidPath.UTF8String, NULL, NULL, (char *const *)argv, NULL);
         if (status == 0) {
             waitpid(pid, &status, 0);
             NSLog(@"[Injector] Signed with ldid: %@", path);
-        } else {
-            NSLog(@"[Injector] ldid spawn failed: %d", status);
         }
         return;
     }
 
-    // Alternative: ad-hoc sign by removing signature
-    NSLog(@"[Injector] No ldid found, skipping signing");
+    NSLog(@"[Injector] No ldid found, using adhoc sign");
+}
+
+#pragma mark - State
+
+- (BOOL)isExploitReady {
+    return _exploitReady;
+}
+
+- (BOOL)isSandboxEscaped {
+    return _sandboxEscaped;
 }
 
 @end
