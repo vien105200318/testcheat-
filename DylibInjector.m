@@ -418,6 +418,14 @@ static void injector_log_device_info(void) {
     NSLog(@"[Injector] Redirect active until device reboot.");
     NSLog(@"[Injector] ========================================");
 
+    // IMPORTANT: Cleanup kernel state immediately after injection
+    // This prevents kernel panic if user kills the app
+    NSLog(@"[Injector] Cleaning up kernel state for safe exit...");
+    kexploit_terminal_cleanup();
+    _exploitReady = NO;
+    _sandboxEscaped = NO;
+    NSLog(@"[Injector] Kernel state cleaned - app can be safely closed now");
+
     return YES;
 }
 
@@ -671,6 +679,13 @@ static void injector_log_device_info(void) {
         return [NSString stringWithFormat:@"iOS %@ được hỗ trợ", UIDevice.currentDevice.systemVersion];
     }
     return injector_unsupported_message();
+}
+
+- (void)resetState {
+    _exploitReady = NO;
+    _sandboxEscaped = NO;
+    _springboardSession = nil;
+    NSLog(@"[Injector] State reset");
 }
 
 @end

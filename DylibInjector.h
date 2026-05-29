@@ -20,5 +20,6 @@
 - (BOOL)isSandboxEscaped;
 - (BOOL)isDeviceSupported;
 - (NSString *)deviceSupportMessage;
+- (void)resetState;
 
 @end
