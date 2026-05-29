@@ -14,6 +14,7 @@
 #import "kexploit/krw.h"
 #import "kexploit/kutils.h"
 #import "kexploit/offsets.h"
+#import "kexploit/vnode.h"
 #import "utils/sandbox.h"
 #import "utils/file.h"
 #import "TaskRop/RemoteCall.h"
@@ -238,66 +239,7 @@ static void injector_log_device_info(void) {
 
     NSLog(@"[Injector] App path: %@", appPath);
 
-    // Step 4: Copy dylib into app bundle
-    NSString *dylibName = [dylibPath lastPathComponent];
-    NSString *destDylibPath = [appPath stringByAppendingPathComponent:dylibName];
-
-    NSLog(@"[Injector] Copying dylib to %@", destDylibPath);
-
-    // Remove existing file first
-    [fm removeItemAtPath:destDylibPath error:nil];
-
-    // Use kernel-level copy for protected app bundles
-    int copyResult = kernel_copy_file(dylibPath.UTF8String, destDylibPath.UTF8String);
-
-    if (copyResult != 0) {
-        NSLog(@"[Injector] kernel_copy_file failed, trying fallbacks...");
-
-        // Fallback 1: Try normal NSFileManager copy
-        NSError *copyError = nil;
-        if (![fm copyItemAtPath:dylibPath toPath:destDylibPath error:&copyError]) {
-            NSLog(@"[Injector] NSFileManager copy failed: %@", copyError.localizedDescription);
-
-            // Fallback 2: Try open/write syscalls
-            NSData *dylibData = [NSData dataWithContentsOfFile:dylibPath];
-            if (!dylibData) {
-                *error = [NSError errorWithDomain:@"InjectorError" code:5
-                                         userInfo:@{NSLocalizedDescriptionKey: @"Cannot read dylib file"}];
-                return NO;
-            }
-
-            int fd = open(destDylibPath.UTF8String, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-            if (fd == -1) {
-                NSLog(@"[Injector] open() failed: %s (errno=%d)", strerror(errno), errno);
-                *error = [NSError errorWithDomain:@"InjectorError" code:6
-                                         userInfo:@{NSLocalizedDescriptionKey:
-                    [NSString stringWithFormat:@"Cannot write to app bundle: %s", strerror(errno)]}];
-                return NO;
-            }
-
-            ssize_t written = write(fd, dylibData.bytes, dylibData.length);
-            close(fd);
-
-            if (written != (ssize_t)dylibData.length) {
-                NSLog(@"[Injector] write() incomplete: %zd/%lu", written, (unsigned long)dylibData.length);
-                *error = [NSError errorWithDomain:@"InjectorError" code:8
-                                         userInfo:@{NSLocalizedDescriptionKey: @"Failed to write dylib data"}];
-                return NO;
-            }
-            NSLog(@"[Injector] Fallback write succeeded");
-        }
-    }
-
-    // Verify file was copied
-    if (![fm fileExistsAtPath:destDylibPath]) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:9
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Dylib copy verification failed"}];
-        return NO;
-    }
-
-    NSLog(@"[Injector] Dylib copied successfully");
-
-    // Step 5: Patch main binary
+    // Get executable name from Info.plist
     NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
     NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
     NSString *executableName = infoPlist[@"CFBundleExecutable"];
@@ -308,28 +250,113 @@ static void injector_log_device_info(void) {
         return NO;
     }
 
-    NSString *binaryPath = [appPath stringByAppendingPathComponent:executableName];
+    NSString *originalBinaryPath = [appPath stringByAppendingPathComponent:executableName];
+    NSLog(@"[Injector] Original binary: %@", originalBinaryPath);
 
-    NSLog(@"[Injector] Patching binary: %@", executableName);
+    // Step 4: Create our injection directory in Documents (writable)
+    NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *injectDir = [docsDir stringByAppendingPathComponent:@"Injected"];
+    NSString *appInjectDir = [injectDir stringByAppendingPathComponent:bundleID];
 
-    NSString *loadPath = [@"@executable_path/" stringByAppendingString:dylibName];
-    if (![self patchBinary:binaryPath toLoadDylib:loadPath error:error]) {
+    [fm createDirectoryAtPath:appInjectDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Step 5: Copy dylib to our writable directory
+    NSString *dylibName = [dylibPath lastPathComponent];
+    NSString *localDylibPath = [appInjectDir stringByAppendingPathComponent:dylibName];
+
+    [fm removeItemAtPath:localDylibPath error:nil];
+    NSError *copyError = nil;
+    if (![fm copyItemAtPath:dylibPath toPath:localDylibPath error:&copyError]) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:5
+                                 userInfo:@{NSLocalizedDescriptionKey:
+            [NSString stringWithFormat:@"Cannot copy dylib: %@", copyError.localizedDescription]}];
+        return NO;
+    }
+    NSLog(@"[Injector] Dylib copied to: %@", localDylibPath);
+
+    // Step 6: Create patched binary in our directory
+    NSString *patchedBinaryPath = [appInjectDir stringByAppendingPathComponent:executableName];
+    [fm removeItemAtPath:patchedBinaryPath error:nil];
+
+    NSData *binaryData = [NSData dataWithContentsOfFile:originalBinaryPath];
+    if (!binaryData) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:10
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot read original binary"}];
         return NO;
     }
 
-    // Step 6: Re-sign binary and dylib (using ldid)
-    NSLog(@"[Injector] Re-signing...");
-    [self signFile:destDylibPath];
-    [self signFile:binaryPath];
+    NSMutableData *mutableData = [binaryData mutableCopy];
 
-    // Step 7: Touch app to invalidate cache
-    NSLog(@"[Injector] Invalidating app cache...");
-    [self touchAppBundle:appPath];
+    // Patch to load our dylib using absolute path
+    NSString *loadPath = localDylibPath; // Use absolute path to our dylib
+    if (![self patchBinaryData:mutableData toLoadDylib:loadPath error:error]) {
+        return NO;
+    }
 
-    NSLog(@"[Injector] Injection completed successfully!");
-    NSLog(@"[Injector] Restart the app to load dylib");
+    if (![mutableData writeToFile:patchedBinaryPath atomically:YES]) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:13
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
+        return NO;
+    }
+    NSLog(@"[Injector] Patched binary created: %@", patchedBinaryPath);
+
+    // Step 7: Use vnode redirect to swap original binary with patched one
+    NSLog(@"[Injector] Redirecting vnode...");
+
+    uint64_t orig_vnode = 0, orig_vdata = 0;
+    if (!vnode_redirect_file(originalBinaryPath.UTF8String, patchedBinaryPath.UTF8String,
+                             &orig_vnode, &orig_vdata)) {
+        *error = [NSError errorWithDomain:@"InjectorError" code:14
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Vnode redirect failed"}];
+        return NO;
+    }
+
+    // Save redirect info for later restoration
+    NSMutableDictionary *redirectInfo = [NSMutableDictionary dictionary];
+    redirectInfo[@"bundleID"] = bundleID;
+    redirectInfo[@"orig_vnode"] = @(orig_vnode);
+    redirectInfo[@"orig_vdata"] = @(orig_vdata);
+    redirectInfo[@"originalBinaryPath"] = originalBinaryPath;
+    redirectInfo[@"patchedBinaryPath"] = patchedBinaryPath;
+    redirectInfo[@"dylibPath"] = localDylibPath;
+
+    NSString *redirectInfoPath = [appInjectDir stringByAppendingPathComponent:@"redirect_info.plist"];
+    [redirectInfo writeToFile:redirectInfoPath atomically:YES];
+
+    NSLog(@"[Injector] ========================================");
+    NSLog(@"[Injector] INJECTION SUCCESSFUL!");
+    NSLog(@"[Injector] Vnode redirected: %@ -> %@", originalBinaryPath, patchedBinaryPath);
+    NSLog(@"[Injector] Dylib: %@", localDylibPath);
+    NSLog(@"[Injector] ========================================");
+    NSLog(@"[Injector] RESTART THE APP TO LOAD DYLIB");
+    NSLog(@"[Injector] Note: Redirect is active until reboot");
 
     return YES;
+}
+
+// Patch binary data (in-memory) to add LC_LOAD_DYLIB
+- (BOOL)patchBinaryData:(NSMutableData *)mutableData
+          toLoadDylib:(NSString *)dylibPath
+                error:(NSError **)error {
+
+    const uint8_t *bytes = mutableData.bytes;
+    uint32_t magic = *(uint32_t *)bytes;
+
+    BOOL success = NO;
+
+    if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+        success = [self patchFatBinary:mutableData dylibName:dylibPath error:error];
+    } else if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64) {
+        success = [self patchMachO64:mutableData offset:0 dylibName:dylibPath error:error];
+    } else if (magic == MH_MAGIC || magic == MH_CIGAM) {
+        success = [self patchMachO32:mutableData offset:0 dylibName:dylibPath error:error];
+    } else {
+        *error = [NSError errorWithDomain:@"InjectorError" code:11
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Unsupported binary format"}];
+        return NO;
+    }
+
+    return success;
 }
 
 - (NSString *)getAppPathForBundleID:(NSString *)bundleID {
@@ -344,77 +371,7 @@ static void injector_log_device_info(void) {
     return nil;
 }
 
-- (void)touchAppBundle:(NSString *)appPath {
-    // Touch Info.plist to invalidate cache
-    NSString *infoPlist = [appPath stringByAppendingPathComponent:@"Info.plist"];
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    NSDictionary *attrs = @{NSFileModificationDate: [NSDate date]};
-    [fm setAttributes:attrs ofItemAtPath:infoPlist error:nil];
-    [fm setAttributes:attrs ofItemAtPath:appPath error:nil];
-}
-
 #pragma mark - Mach-O Patching
-
-- (BOOL)patchBinary:(NSString *)binaryPath
-      toLoadDylib:(NSString *)dylibName
-              error:(NSError **)error {
-
-    NSData *binaryData = [NSData dataWithContentsOfFile:binaryPath];
-    if (!binaryData) {
-        *error = [NSError errorWithDomain:@"InjectorError" code:10
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Cannot read binary"}];
-        return NO;
-    }
-
-    NSMutableData *mutableData = [binaryData mutableCopy];
-    const uint8_t *bytes = mutableData.bytes;
-    uint32_t magic = *(uint32_t *)bytes;
-
-    BOOL success = NO;
-
-    if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
-        success = [self patchFatBinary:mutableData dylibName:dylibName error:error];
-    } else if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64) {
-        success = [self patchMachO64:mutableData offset:0 dylibName:dylibName error:error];
-    } else if (magic == MH_MAGIC || magic == MH_CIGAM) {
-        success = [self patchMachO32:mutableData offset:0 dylibName:dylibName error:error];
-    } else {
-        *error = [NSError errorWithDomain:@"InjectorError" code:11
-                                 userInfo:@{NSLocalizedDescriptionKey: @"Unsupported binary format"}];
-        return NO;
-    }
-
-    if (success) {
-        // Write patched binary using kernel-level operations
-        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"patched_binary"];
-        if ([mutableData writeToFile:tmpPath atomically:YES]) {
-            // Use kernel_overwrite_file for protected binary
-            int ret = kernel_overwrite_file(tmpPath.UTF8String, binaryPath.UTF8String);
-            if (ret != 0) {
-                // Fallback to normal write
-                NSLog(@"[Injector] kernel_overwrite_file failed, trying normal write...");
-                if (![mutableData writeToFile:binaryPath atomically:YES]) {
-                    NSLog(@"[Injector] Binary write failed!");
-                    *error = [NSError errorWithDomain:@"InjectorError" code:13
-                                             userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
-                    [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
-                    return NO;
-                }
-            }
-            [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
-        } else {
-            // Direct write if temp fails
-            if (![mutableData writeToFile:binaryPath atomically:YES]) {
-                *error = [NSError errorWithDomain:@"InjectorError" code:13
-                                         userInfo:@{NSLocalizedDescriptionKey: @"Cannot write patched binary"}];
-                return NO;
-            }
-        }
-    }
-
-    return success;
-}
 
 - (BOOL)patchFatBinary:(NSMutableData *)data dylibName:(NSString *)dylibName error:(NSError **)error {
     const uint8_t *bytes = data.bytes;
