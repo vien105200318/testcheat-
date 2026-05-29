@@ -459,8 +459,11 @@ static void injector_log_device_info(void) {
     NSLog(@"[Injector] Process: %@ (PID %d)", executableName, session.pid);
     NSLog(@"[Injector] ========================================");
 
-    // Keep session alive - don't destroy it immediately
-    // The dylib is now loaded and running
+    // Destroy session immediately after successful injection
+    // The dylib is already loaded into target process memory
+    // Keeping session alive causes crash when injector app goes to background
+    [session destroyRemoteCall];
+    NSLog(@"[Injector] Session cleaned up - you can now close this app");
 
     return YES;
 }
