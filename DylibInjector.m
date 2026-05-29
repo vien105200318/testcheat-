@@ -468,11 +468,25 @@ static void injector_log_device_info(void) {
     return YES;
 }
 
-// Find PID for a process name
+// Find PID for a process name using kernel (more reliable than proc_listpids)
 - (pid_t)findPidForProcessName:(NSString *)processName {
-    // Use proc_listpids or iterate through /proc
+    NSLog(@"[Injector] Looking for process: %@", processName);
+
+    // Method 1: Use kernel proc_find_by_name (most reliable after exploit)
+    uint64_t proc = proc_find_by_name(processName.UTF8String);
+    if (proc && is_kaddr_valid(proc)) {
+        pid_t pid = kread32(proc + off_proc_p_pid);
+        NSLog(@"[Injector] Found via kernel: proc=0x%llx pid=%d", proc, pid);
+        if (pid > 0) return pid;
+    }
+
+    // Method 2: Fallback to proc_listpids (may be sandbox blocked)
+    NSLog(@"[Injector] Kernel lookup failed, trying proc_listpids...");
     int pidCount = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (pidCount <= 0) return -1;
+    if (pidCount <= 0) {
+        NSLog(@"[Injector] proc_listpids failed: %d", pidCount);
+        return -1;
+    }
 
     pid_t *pids = malloc(pidCount * sizeof(pid_t));
     if (!pids) return -1;
@@ -486,6 +500,7 @@ static void injector_log_device_info(void) {
             NSString *path = [NSString stringWithUTF8String:pathBuffer];
             if ([path.lastPathComponent isEqualToString:processName]) {
                 foundPid = pids[i];
+                NSLog(@"[Injector] Found via proc_listpids: %@", path);
                 break;
             }
         }
